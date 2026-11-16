@@ -1,0 +1,52 @@
+[package]
+name = "layout-switcher"
+version = "0.9.0"
+edition = "2021"
+description = "Автоперемикач розкладки EN <-> UK для Windows"
+license = "MIT"
+# Звідси програма бере адресу для оновлень (і release.yml перевіряє, що вона збігається з репозиторієм, де йде збірка).
+# Заповнювач OWNER вимикає перевірку оновлень у збірці.
+repository = "https://github.com/Danix1005/layout-switcher"
+
+[lib]
+name = "layout_switcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "layout-switcher"
+path = "src/main.rs"
+
+[features]
+# Лише для перевірки оновлень на локальному сервері (змінні LS_UPDATE_*). У пакет не входить.
+update-test = []
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies]
+fst = { version = "0.4", default-features = false }
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

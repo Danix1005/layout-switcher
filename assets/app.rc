@@ -1,0 +1,38 @@
+// Ресурси exe. Значок 1 — «працює» (його ж показує Провідник), значок 2 — «пауза» (тільки для області
+// сповіщень). Номери значків використовує src/tray.rs. Текст — лише ASCII: так збирається однаково
+// і з rc.exe (Windows), і з windres (крос-збірка).
+//
+// Це ШАБЛОН: build.rs підставляє версію (@VER_COMMA@, @VER_STR@) і абсолютні шляхи до файлів (@ASSETS@).
+
+#define RT_MANIFEST 24
+
+1 ICON "@ASSETS@/icon.ico"
+2 ICON "@ASSETS@/icon_off.ico"
+1 RT_MANIFEST "@ASSETS@/app.manifest"
+
+1 VERSIONINFO
+FILEVERSION @VER_COMMA@
+PRODUCTVERSION @VER_COMMA@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Keyboard layout auto-switcher EN/UK"
+            VALUE "FileVersion", "@VER_STR@"
+            VALUE "InternalName", "layout-switcher"
+            VALUE "OriginalFilename", "layout-switcher.exe"
+            VALUE "ProductName", "layout-switcher"
+            VALUE "ProductVersion", "@VER_STR@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,56 @@
+# Випуск: пушиш тег vX.Y.Z (X.Y.Z має збігатися з version у Cargo.toml) — ця збірка проганяє тести, збирає exe для
+# Windows, пакет і SHA256SUMS та створює реліз на GitHub. Програма оновлюється саме з цього релізу.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Перевірка версії й адреси репозиторію
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME не збігається з версією в Cargo.toml (v$ver)"; exit 1
+          fi
+          # Програма бере адресу оновлень із repository у Cargo.toml: вона має вказувати на цей репозиторій
+          if ! grep -qi "^repository *= *\"https://github.com/$GITHUB_REPOSITORY\"" Cargo.toml; then
+            echo "::error::У Cargo.toml поле repository має бути https://github.com/$GITHUB_REPOSITORY"; exit 1
+          fi
+          if ! grep -q "^## $ver\$" CHANGELOG.md; then
+            echo "::error::У CHANGELOG.md нема розділу «## $ver»"; exit 1
+          fi
+
+      - name: Інструменти для збирання під Windows
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+          rustup default stable
+
+      - name: Тести, збирання, пакет
+        run: bash tools/package.sh
+
+      - name: Опис релізу з CHANGELOG.md
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="## $ver" '$0==v {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md
+
+      - name: Створення релізу
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/release/layout-switcher.exe \
+            dist/release/layout-switcher-windows.zip \
+            dist/release/SHA256SUMS \
+            --verify-tag --title "layout-switcher ${GITHUB_REF_NAME#v}" --notes-file notes.md
