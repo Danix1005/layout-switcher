@@ -33,7 +33,7 @@
 | `assets/` | іконки (`icon.ico` — працює, `icon_off.ico` — пауза), `icon_dual_source.png` (малюнок, з якого `make_icon.py` бере великі розміри), шаблон ресурсів `app.rc`, маніфест; `build.rs` вбудовує іконки в exe |
 | `dict/` | словники (потрібні й програмі, і тестам) |
 | `package/` | файли, що йдуть у пакет поруч з exe: `ЧИТАЙ.txt`, `start-with-log.bat`, `apps-off.txt` |
-| `.github/workflows/` | `release.yml` (випуск за тегом `vX.Y.Z`), `ci.yml` (тести на кожен пуш) |
+| `.github/workflows/` | `release.yml` (випуск за новою версією в `main`), `ci.yml` (тести на кожен пуш) |
 | `LICENSE`, `NOTICE.md` | ліцензія коду (MIT) і ліцензії словників та інших сторонніх матеріалів |
 
 Усе, що не залежить від Windows (`detect`, `keymap`, `hotkey`, `apps`, `inject`, `session`, `privacy`, `cli`, `update`, `sha256`, `json`), зібрано в бібліотеку
@@ -200,10 +200,11 @@ Windows 11 за замовчуванням ховає нові значки в �
 
 1. Підняти `version` у `Cargo.toml`, додати розділ `## X.Y.Z` у `CHANGELOG.md` (його текст стане описом релізу; якщо
    змінились словники — додати в розділ рядок `[full-package]`).
-2. Закомітити, поставити тег і запушити його: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-3. `release.yml` перевірить, що тег збігається з версією, а `repository` у `Cargo.toml` — із цим репозиторієм, запустить тести,
-   збере `layout-switcher.exe`, `layout-switcher-windows.zip`, `SHA256SUMS` і створить реліз. Програми в користувачів
-   побачать його при найближчій перевірці.
+2. Закомітити й запушити в `main`: `git push origin main`. Увага: пуш у `main` з новою версією — це вже випуск.
+3. `release.yml` побачить, що релізу `vX.Y.Z` ще нема, перевірить, що `repository` у `Cargo.toml` вказує на цей
+   репозиторій, запустить тести, збере `layout-switcher.exe`, `layout-switcher-windows.zip`, `SHA256SUMS`, створить тег
+   `vX.Y.Z` і реліз. Програми в користувачів побачать його при найближчій перевірці. Пуш без зміни версії нічого не
+   випускає; тег `vX.Y.Z`, запушений вручну, теж запускає випуск.
 
 ## Ручне виправлення: подвійний лівий Shift
 

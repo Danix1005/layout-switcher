@@ -21,7 +21,7 @@
 - Події `update` у лозі (`check`, `install`, `restarted`).
 - Службовий параметр `--after-update=N`.
 - Публікація: `LICENSE` (MIT), `NOTICE.md` (сторонні дані: CC BY-SA 4.0, MPL 1.1), `.gitattributes`,
-  `.github/workflows/release.yml` (тег `vX.Y.Z` → тести, збірка, реліз із `layout-switcher.exe`,
+  `.github/workflows/release.yml` (нова версія в `main` → тести, збірка, реліз із `layout-switcher.exe`,
   `layout-switcher-windows.zip` і `SHA256SUMS`) та `ci.yml` (тести на кожен пуш).
 - `tools/package.sh` тепер готує й `dist/release/` (exe, zip, `SHA256SUMS`).
 - **Новий значок** (стиль `dual`): дві накладені клавіатури на темній плитці — сіро-синя позаду й салатова попереду.

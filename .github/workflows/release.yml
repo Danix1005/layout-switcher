@@ -1,26 +1,42 @@
-# Випуск: пушиш тег vX.Y.Z (X.Y.Z має збігатися з version у Cargo.toml) — ця збірка проганяє тести, збирає exe для
-# Windows, пакет і SHA256SUMS та створює реліз на GitHub. Програма оновлюється саме з цього релізу.
+# Випуск: піднімаєш version у Cargo.toml, додаєш розділ «## X.Y.Z» у CHANGELOG.md і пушиш у main. Якщо релізу vX.Y.Z
+# ще нема, ця збірка проганяє тести, збирає exe для Windows, пакет і SHA256SUMS, створює тег vX.Y.Z і реліз на GitHub.
+# Програма оновлюється саме з цього релізу. Пуш без зміни версії нічого не випускає. Тег vX.Y.Z, запушений вручну,
+# теж працює (X.Y.Z має збігатися з version у Cargo.toml).
 name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Перевірка версії й адреси репозиторію
+      - name: Версія й перевірки
+        id: ver
         run: |
           ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$ver" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Тег $GITHUB_REF_NAME не збігається з версією в Cargo.toml (v$ver)"; exit 1
           fi
+          if gh release view "v$ver" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Реліз v$ver уже існує — нічого не випускаємо."
+            echo "need=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "need=yes" >> "$GITHUB_OUTPUT"
           # Програма бере адресу оновлень із repository у Cargo.toml: вона має вказувати на цей репозиторій
           if ! grep -qi "^repository *= *\"https://github.com/$GITHUB_REPOSITORY\"" Cargo.toml; then
             echo "::error::У Cargo.toml поле repository має бути https://github.com/$GITHUB_REPOSITORY"; exit 1
@@ -30,6 +46,7 @@ jobs:
           fi
 
       - name: Інструменти для збирання під Windows
+        if: steps.ver.outputs.need == 'yes'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
@@ -37,20 +54,21 @@ jobs:
           rustup default stable
 
       - name: Тести, збирання, пакет
+        if: steps.ver.outputs.need == 'yes'
         run: bash tools/package.sh
 
       - name: Опис релізу з CHANGELOG.md
+        if: steps.ver.outputs.need == 'yes'
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          awk -v v="## $ver" '$0==v {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+          awk -v v="## ${{ steps.ver.outputs.ver }}" '$0==v {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
           test -s notes.md
 
-      - name: Створення релізу
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Створення релізу (і тега, якщо його ще нема)
+        if: steps.ver.outputs.need == 'yes'
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          ver="${{ steps.ver.outputs.ver }}"
+          gh release create "v$ver" \
             dist/release/layout-switcher.exe \
             dist/release/layout-switcher-windows.zip \
             dist/release/SHA256SUMS \
-            --verify-tag --title "layout-switcher ${GITHUB_REF_NAME#v}" --notes-file notes.md
+            --target "$GITHUB_SHA" --title "layout-switcher $ver" --notes-file notes.md
