@@ -18,7 +18,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use layout_switcher::apps::is_sensitive;
-use layout_switcher::keymap::{convert_text, Lang};
+use layout_switcher::keymap::{convert_text, keys_for, Lang};
 use layout_switcher::privacy::redact;
 
 use windows_sys::Win32::System::DataExchange::{
@@ -30,10 +30,11 @@ use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CONTROL,
+    MapVirtualKeyW, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_CONTROL,
     VK_INSERT, VK_SHIFT,
 };
 
+use crate::learned;
 use crate::logger::{log_event, say, with_log};
 use crate::win::{down, key_input, request_layout};
 
@@ -46,6 +47,9 @@ const LOG_CHARS: usize = 300;
 const MAX_BACKUP: usize = 64 * 1024 * 1024;
 /// Скільки чекаємо, поки застосунок вставить текст, перш ніж повертати старий буфер.
 const PASTE_WAIT: Duration = Duration::from_millis(350);
+/// Якщо буфер обміну не дається (Adobe Acrobat тримає його після копіювання), короткий результат набираємо
+/// «клавішами» — набір замінює виділене. Довгий так не набираємо: це повільно й ризиковано.
+const TYPE_MAX: usize = 200;
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -151,13 +155,18 @@ unsafe fn run(req: &SelReq) {
     }
 
     // 3) вставляємо результат
-    if !set_text_private(&conv.text) {
+    let typed = if set_text_private(&conv.text) {
+        send_chord(VK_SHIFT, VK_INSERT);
+        sleep(PASTE_WAIT);
+        false
+    } else if n_chars <= TYPE_MAX && !conv.text.contains(['\n', '\r', '\t']) {
+        type_text(&conv.text);
+        true
+    } else {
         restore(&backup);
         noop(req, "set_failed");
         return;
-    }
-    send_chord(VK_SHIFT, VK_INSERT);
-    sleep(PASTE_WAIT);
+    };
 
     // 4) повертаємо буфер і розкладку
     restore(&backup);
@@ -179,6 +188,9 @@ unsafe fn run(req: &SelReq) {
             ("to", format!("{:?}", to)),
             ("chars", n_chars.to_string()),
         ];
+        if typed {
+            f.push(("via", "typed".into())); // буфер обміну був зайнятий — результат набрано клавішами
+        }
         if lg.words && masked {
             f.push(("masked", "1".into()));
         } else if lg.words {
@@ -188,6 +200,28 @@ unsafe fn run(req: &SelReq) {
         }
         lg.line("manual", &f);
     });
+
+    // Одне слово, перенесене вручну, можна запам'ятати (вирішить потік хука — у нього словники).
+    // Подвійний клік у браузері виділяє слово разом із пробілом після нього — пробіли по краях не рахуємо.
+    let word = text.trim();
+    if !masked && !word.is_empty() && !word.chars().any(char::is_whitespace) {
+        if let Some(keys) = keys_for(word, conv.from) {
+            learned::offer(keys, to);
+        }
+    }
+}
+
+/// Надрукувати текст символами Unicode (без розкладки й без буфера обміну).
+unsafe fn type_text(text: &str) {
+    let mut v: Vec<INPUT> = Vec::with_capacity(text.len() * 4);
+    for ch in text.chars() {
+        let mut buf = [0u16; 2];
+        for &u in ch.encode_utf16(&mut buf).iter() {
+            v.push(key_input(0, u, KEYEVENTF_UNICODE));
+            v.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+        }
+    }
+    SendInput(v.len() as u32, v.as_ptr(), std::mem::size_of::<INPUT>() as i32);
 }
 
 // ───────────────────────────── введення ─────────────────────────────

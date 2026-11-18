@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "layout-switcher"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "embed-resource",
  "fst",

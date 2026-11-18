@@ -48,6 +48,7 @@ const CMD_LOG_OFF: usize = 1010;
 const CMD_LOG_PLAIN: usize = 1011;
 const CMD_LOG_WORDS: usize = 1012;
 const CMD_OPEN_LOG: usize = 1013;
+const CMD_OPEN_LEARNED: usize = 1014;
 const CMD_AUTOSTART: usize = 1020;
 const CMD_UPDATE_CHECK: usize = 1030;
 const CMD_UPDATE_AUTO: usize = 1031;
@@ -328,6 +329,7 @@ unsafe fn show_menu(hwnd: HWND) {
     item(log_menu, checked(log_on && words), CMD_LOG_WORDS, "Зі словами (для аналізу помилок)…");
     AppendMenuW(menu, MF_POPUP, log_menu as usize, win::wide("Запис логу").as_ptr());
     item(menu, MF_STRING, CMD_OPEN_LOG, "Показати теку з логом");
+    item(menu, MF_STRING, CMD_OPEN_LEARNED, "Вивчені слова…");
 
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     let upd_menu = CreatePopupMenu();
@@ -377,6 +379,7 @@ unsafe fn command(hwnd: HWND, id: usize) {
             }
         }
         CMD_OPEN_LOG => open_log_folder(),
+        CMD_OPEN_LEARNED => open_learned(),
         CMD_AUTOSTART => toggle_autostart(),
         CMD_UPDATE_CHECK => updater::check_now(true),
         CMD_UPDATE_INSTALL => updater::install(),
@@ -420,6 +423,19 @@ unsafe fn open_log_folder() {
         }
         None => {
             with_tray(|t| balloon(t, "Логу ще нема", "Увімкни запис логу в меню — файл з'явиться поруч з програмою."));
+        }
+    }
+}
+
+/// Провідник із виділеним файлом вивчених слів (файли створюються, якщо їх ще нема).
+unsafe fn open_learned() {
+    match crate::learned::ensure_files() {
+        Some(path) => {
+            let args = win::wide(&format!("/select,\"{}\"", path.display()));
+            ShellExecuteW(null_mut(), win::wide("open").as_ptr(), win::wide("explorer.exe").as_ptr(), args.as_ptr(), null(), 1);
+        }
+        None => {
+            with_tray(|t| balloon(t, "Не вдалося створити файл", "Не можу записати в %APPDATA%\\layout-switcher."));
         }
     }
 }

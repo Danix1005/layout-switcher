@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use fst::Set;
 
-use crate::keymap::{convert, is_tracked_key, render, Key, Lang};
+use crate::keymap::{char_for, convert, is_tracked_key, render, Key, Lang};
+use crate::privacy::looks_secret;
 
 /// Звичайні слова (з основних словників) — від цієї довжини. Двобуквені — окремий режим нижче.
 pub const MIN_LEN: usize = 3;
@@ -347,6 +348,10 @@ impl Dicts {
         if keys.iter().any(|k| !is_tracked_key(k.vk) || matches!(k.vk, 0xBB | 0xDC)) {
             return Verdict::NonWord;
         }
+        // Адреса сайту чи пошти, набрана в українській розкладці: `аучютуе` -> `fex.net`.
+        if let Some(fix) = self.web_fix(keys, cur) {
+            return Verdict::Fix(fix);
+        }
         // Цифри й дефіс всередині — слово «складене» (KIT005, start-config, 192ю168ю1ю10).
         let verdict = if keys.iter().any(is_separator) {
             self.verdict_compound(keys, cur, ctx)
@@ -451,6 +456,167 @@ impl Dicts {
             _ => None,
         }
     }
+
+    /// Адреса сайту або пошти, набрана в українській розкладці (`аучютуе` -> `fex.net`,
+    /// `гіук"фвьшт.сщь` -> `user@admin.com`). Словників тут нема, тому правило суворе: англійський вигляд має бути
+    /// доменом із відомою зоною (`.com`, `.net`, `.ua`…) або поштою, а український — не словом.
+    fn web_fix(&self, keys: &[Key], cur: Lang) -> Option<Fix> {
+        if cur != Lang::Uk || keys.len() < 4 {
+            return None;
+        }
+        let text = convert(keys, cur);
+        let bare = text
+            .trim_start_matches(['(', '"', '\'', '«'])
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"', '\'', '»']);
+        if !looks_like_web_address(bare) {
+            return None;
+        }
+        if self.known(Lang::Uk, &core(&render(keys, cur))) {
+            return None;
+        }
+        Some(Fix { text, to: Lang::En })
+    }
+
+    /// Читає додатковий список слів (по слову на рядок, `#` — коментар) і додає їх як явні слова мови.
+    /// Повертає, скільки слів прочитано. Нема файлу — помилка (її можна ігнорувати).
+    pub fn add_words_from(&mut self, path: &Path, lang: Lang) -> io::Result<usize> {
+        let words = read_words(path)?;
+        for w in &words {
+            self.add_word(lang, w);
+        }
+        Ok(words.len())
+    }
+
+    /// Користувач сам переніс слово в розкладку `lang` (подвійним Shift), і воно так і лишилось. Чи варто його
+    /// запам'ятати, щоб наступного разу виправляти без нього? Так — лише якщо словники про нього нічого не знають
+    /// в обох прочитаннях (назви, прізвища, терміни: `LuxOpt`, `SiTime`). Повертає слово для особистого словника.
+    /// Слова, схожі на пароль, і «справжні» слова іншої мови (`сім` ↔ `csv`) — ні.
+    pub fn learnable(&self, keys: &[Key], lang: Lang) -> Option<String> {
+        let (word, other) = learn_forms(keys, lang)?;
+        if word.chars().count() < MIN_LEN {
+            return None;
+        }
+        if self.known(lang, &word) || self.is_explicit(lang, &word) {
+            return None; // уже відоме — автомат і так його не зіпсує; не вистачало іншого
+        }
+        if self.known(lang.other(), &other) || self.is_explicit(lang.other(), &other) {
+            return None; // «чуже» прочитання — теж слово: вирішувати автоматично не можна
+        }
+        let letters = |s: &str| core(s);
+        if self.known(lang, &letters(&word)) || self.known(lang.other(), &letters(&other)) {
+            return None;
+        }
+        Some(word)
+    }
+
+    /// Користувач скасував АВТОМАТИЧНЕ виправлення подвійним Shift: слово, яке він набрав у розкладці `lang`, —
+    /// справжнє, і чіпати його більше не треба. Повертає слово для особистого словника.
+    pub fn learnable_revert(&self, keys: &[Key], lang: Lang) -> Option<String> {
+        let (word, _) = learn_forms(keys, lang)?;
+        if word.chars().count() < 2 || self.is_explicit(lang, &word) {
+            return None;
+        }
+        Some(word)
+    }
+}
+
+/// Обидва прочитання слова для особистого словника: `(у розкладці lang, в іншій)`. `None` — слово не годиться:
+/// службові клавіші, схоже на пароль, задовге, без літер або із символами, яких у словах цієї мови не буває.
+fn learn_forms(keys: &[Key], lang: Lang) -> Option<(String, String)> {
+    if keys.is_empty() || keys.iter().any(|k| !is_tracked_key(k.vk) || matches!(k.vk, 0xBB | 0xDC)) {
+        return None;
+    }
+    let shown = render(keys, lang);
+    let other = render(keys, lang.other());
+    if looks_secret(&shown) || looks_secret(&other) {
+        return None;
+    }
+    let word = core_alnum(&shown);
+    let n = word.chars().count();
+    if n == 0 || n > 40 || !word.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    let fits = match lang {
+        Lang::En => word.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '\'')),
+        Lang::Uk => word.chars().all(|c| is_uk_letter(c) || c.is_ascii_digit() || matches!(c, '-' | '\'' | 'ʼ')),
+    };
+    fits.then(|| (word, core_alnum(&other)))
+}
+
+fn is_uk_letter(c: char) -> bool {
+    matches!(c, 'а'..='я' | 'А'..='Я' | 'і' | 'ї' | 'є' | 'ґ' | 'І' | 'Ї' | 'Є' | 'Ґ')
+}
+
+/// Однолітерні слова: українські («в базу», «а потім») і англійські (`a`, `I`).
+const SINGLE_UK: &[char] = &['а', 'в', 'з', 'і', 'й', 'о', 'у', 'я'];
+const SINGLE_EN: &[char] = &['a', 'i'];
+
+fn single_word(c: char, lang: Lang) -> bool {
+    let c = c.to_lowercase().next().unwrap_or(c);
+    match lang {
+        Lang::Uk => SINGLE_UK.contains(&c),
+        Lang::En => SINGLE_EN.contains(&c),
+    }
+}
+
+/// Однолітерне слово перед словом, яке щойно виправили з розкладки `cur` на іншу: `d` + `,fpe` -> «в базу».
+/// Якщо ця літера в розкладці `cur` — не слово, а в іншій — слово, повертає, якою вона має стати.
+/// Літеру, набрану свідомо (`D` — диск D посеред українського тексту), відсікає програма: вона пропонує
+/// лише ту літеру, перед якою розкладку ніхто не перемикав.
+pub fn single_letter_fix(key: Key, cur: Lang) -> Option<String> {
+    if !is_tracked_key(key.vk) {
+        return None;
+    }
+    let typed = char_for(key, cur);
+    let conv = char_for(key, cur.other());
+    (!single_word(typed, cur) && single_word(conv, cur.other())).then(|| conv.to_string())
+}
+
+/// Відомі доменні зони (з них складається більшість адрес, які набирають наші користувачі).
+const TLDS: &[&str] = &[
+    "com", "net", "org", "ua", "io", "dev", "info", "biz", "me", "co", "app", "ai", "uk", "de", "pl", "eu", "gov",
+    "edu", "tv", "cc", "site", "online", "store", "shop", "tech", "cloud", "pro", "xyz", "us", "ca", "fr", "it",
+    "es", "nl", "cz", "sk", "lt", "lv", "ee", "md", "ge", "kz", "at", "ch", "se", "no", "fi", "dk", "be", "ro",
+    "hu", "bg", "gr", "pt", "il", "tr", "jp", "cn", "in", "br", "au", "nz", "mil", "int", "local", "lan", "email",
+    "news", "blog", "page", "link", "live", "world", "agency", "digital", "media", "team", "group", "club",
+    "space", "website", "top",
+];
+
+/// Чи схожий текст на адресу сайту (`fex.net`, `www.olx.ua/uk`, `https://site.com`) або пошти (`a.b@ukr.net`).
+pub fn looks_like_web_address(s: &str) -> bool {
+    let s = s.to_lowercase();
+    if let Some((local, domain)) = s.split_once('@') {
+        let local_ok = !local.is_empty()
+            && local.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '%'));
+        return local_ok && !domain.contains('/') && is_host(domain);
+    }
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(&s);
+    let (host, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, p),
+        None => (rest, ""),
+    };
+    let path_ok = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '?' | '=' | '&' | '%' | '#' | '+' | '~'));
+    path_ok && is_host(host)
+}
+
+fn is_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 || labels.len() > 6 {
+        return false;
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let tld = labels[labels.len() - 1];
+    labels.iter().all(|l| label_ok(l))
+        && TLDS.contains(&tld)
+        && labels[..labels.len() - 1].iter().any(|l| l.chars().any(|c| c.is_ascii_alphabetic() || c.is_ascii_digit()))
 }
 
 /// Роздільник у складеному слові: цифра без Shift або дефіс/підкреслення.
@@ -1049,5 +1215,108 @@ mod tests {
         eprintln!("англ. слова, набрані в UK: виправлено {f2}/{t2} ({:.1}%)", 100.0 * f2 as f64 / t2 as f64);
         assert!(f1 as f64 / t1 as f64 > 0.9);
         assert!(f2 as f64 / t2 as f64 > 0.9);
+    }
+
+    // ── 0.9.1: адреси, особистий словник, однолітерні слова ──
+
+    /// Як було б набрано англійський текст `en`, якщо розкладка — українська.
+    fn in_uk_layout(en: &str) -> Vec<Key> {
+        typed(en, Lang::En)
+    }
+
+    #[test]
+    fn web_addresses_typed_in_uk_layout_are_fixed() {
+        let d = dicts();
+        for addr in ["fex.net", "aernd.com", "www.olx.ua", "user@ukr.net", "a.b-c@mail.example.com", "site.com.ua/uk"] {
+            let fix = d.judge(&in_uk_layout(addr), Lang::Uk).unwrap_or_else(|| panic!("{addr}"));
+            assert_eq!((fix.text.as_str(), fix.to), (addr, Lang::En), "{addr}");
+        }
+        // розділовий знак речення після адреси лишається українським
+        let mut keys = in_uk_layout("fex.net");
+        keys.extend(typed(",", Lang::Uk));
+        assert_eq!(d.judge(&keys, Lang::Uk).unwrap().text, "fex.net,");
+    }
+
+    #[test]
+    fn web_rule_leaves_ordinary_text_alone() {
+        let d = Dicts::from_words(["hello"], ["люди", "сюди"]);
+        // українські слова з «ю», справжні адреси в англійській розкладці, скорочення «м.Львів»
+        assert!(d.judge(&typed("люди", Lang::Uk), Lang::Uk).is_none());
+        assert!(d.judge(&typed("сюди", Lang::Uk), Lang::Uk).is_none());
+        assert!(d.judge(&typed("fex.net", Lang::En), Lang::En).is_none());
+        assert!(d.judge(&typed("м.Львів", Lang::Uk), Lang::Uk).is_none());
+        // невідома зона — не адреса
+        assert!(d.judge(&in_uk_layout("fex.qqq"), Lang::Uk).is_none());
+    }
+
+    #[test]
+    fn web_address_shapes() {
+        for ok in ["fex.net", "WWW.Google.COM", "https://site.ua/a?b=1", "x1.io", "a@b.ua", "1c.ua"] {
+            assert!(looks_like_web_address(ok), "{ok}");
+        }
+        for bad in ["fex", "fex.", ".net", "a..net", "-a.com", "a@", "@a.com", "v/kmdsd", "a@b.com/x", "tel.qq"] {
+            assert!(!looks_like_web_address(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn learns_unknown_words_moved_by_hand() {
+        let d = Dicts::from_words(["csv", "dell"], ["сім", "база"]);
+        assert_eq!(d.learnable(&typed("LuxOpt", Lang::En), Lang::En).as_deref(), Some("luxopt"));
+        assert_eq!(d.learnable(&typed("SiTime,", Lang::En), Lang::En).as_deref(), Some("sitime"));
+        assert_eq!(d.learnable(&typed("ae-work", Lang::En), Lang::En).as_deref(), Some("ae-work"));
+        assert_eq!(d.learnable(&typed("Шевчук", Lang::Uk), Lang::Uk).as_deref(), Some("шевчук"));
+        // «сім» — справжнє слово: перенесення в `csv` не вчимо (інакше «сім» завжди ставало б `csv`)
+        assert_eq!(d.learnable(&typed("csv", Lang::En), Lang::En), None);
+        // уже відоме слово — вчити нічого
+        assert_eq!(d.learnable(&typed("dell", Lang::En), Lang::En), None);
+        // коротке, схоже на пароль, задовге
+        assert_eq!(d.learnable(&typed("ab", Lang::En), Lang::En), None);
+        assert_eq!(d.learnable(&typed("Qwerty123!", Lang::En), Lang::En), None);
+        assert_eq!(d.learnable(&typed(&"a".repeat(41), Lang::En), Lang::En), None);
+    }
+
+    #[test]
+    fn learned_word_is_fixed_next_time() {
+        let mut d = Dicts::from_words(["hello"], ["привіт"]);
+        let keys = typed("ДгчЩзе", Lang::Uk); // LuxOpt, набране в українській
+        assert!(d.judge(&keys, Lang::Uk).is_none());
+        let w = d.learnable(&keys, Lang::En).unwrap();
+        d.add_word(Lang::En, &w);
+        assert_eq!(d.judge(&keys, Lang::Uk).unwrap().text, "LuxOpt");
+        // складене слово теж
+        let keys = typed("фу-цщкл", Lang::Uk);
+        let w = d.learnable(&keys, Lang::En).unwrap();
+        d.add_word(Lang::En, &w);
+        assert_eq!(d.judge(&keys, Lang::Uk).unwrap().text, "ae-work");
+    }
+
+    #[test]
+    fn revert_teaches_to_leave_the_word_alone() {
+        let mut d = Dicts::from_words(["itch"], ["привіт"]);
+        let keys = typed("шеср", Lang::Uk);
+        assert_eq!(d.judge(&keys, Lang::Uk).unwrap().text, "itch");
+        let w = d.learnable_revert(&keys, Lang::Uk).unwrap();
+        assert_eq!(w, "шеср");
+        d.add_word(Lang::Uk, &w);
+        assert!(d.judge(&keys, Lang::Uk).is_none());
+        assert!(d.judge(&keys, Lang::Uk).is_none());
+    }
+
+    #[test]
+    fn single_letter_before_a_fixed_word() {
+        let k = |c: &str, l| typed(c, l)[0];
+        assert_eq!(single_letter_fix(k("d", Lang::En), Lang::En).as_deref(), Some("в"));
+        assert_eq!(single_letter_fix(k("D", Lang::En), Lang::En).as_deref(), Some("В"));
+        assert_eq!(single_letter_fix(k("f", Lang::En), Lang::En).as_deref(), Some("а"));
+        assert_eq!(single_letter_fix(k("s", Lang::En), Lang::En).as_deref(), Some("і"));
+        assert_eq!(single_letter_fix(k("ф", Lang::Uk), Lang::Uk).as_deref(), Some("a"));
+        assert_eq!(single_letter_fix(k("Ш", Lang::Uk), Lang::Uk).as_deref(), Some("I"));
+        // справжнє слово своєї мови не чіпаємо: «a» в англійській, «в» в українській
+        assert_eq!(single_letter_fix(k("a", Lang::En), Lang::En), None);
+        assert_eq!(single_letter_fix(k("в", Lang::Uk), Lang::Uk), None);
+        // літера, яка ніде не слово
+        assert_eq!(single_letter_fix(k("x", Lang::En), Lang::En), None);
+        assert_eq!(single_letter_fix(k("5", Lang::En), Lang::En), None);
     }
 }

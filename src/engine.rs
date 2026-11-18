@@ -11,7 +11,7 @@ use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
 use layout_switcher::apps::{is_sensitive, AppMode, AppRules, OffReason};
-use layout_switcher::detect::{Dicts, Verdict};
+use layout_switcher::detect::{single_letter_fix, Dicts, Verdict};
 use layout_switcher::hotkey::DoubleShift;
 use layout_switcher::inject::InjectedPolicy;
 use layout_switcher::keymap::{convert, is_tracked_key, render, Key, Lang};
@@ -25,6 +25,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, KillTimer, SetTimer};
 
+use crate::learned;
 use crate::logger::{log_enabled, log_event, say, with_log};
 use crate::selection;
 use crate::win::{self, down, hkl_hex, key_input, tap};
@@ -95,6 +96,27 @@ pub(crate) struct State {
     told_off: HashSet<String>,
     told_layout: HashSet<String>,
     last_key_at: Instant,
+    /// Слово, яке користувач переніс подвійним Shift: запам'ятаємо його (learned.rs), коли він піде далі
+    /// (почне нове слово), а не одразу — раптом він натисне Shift ще раз і поверне як було.
+    pending_learn: Option<PendingLearn>,
+    /// Слово, що набирається, вже переносили подвійним Shift — у яку розкладку.
+    manual_mid: Option<Lang>,
+    /// Попереднє слово — одна літера, а за нею пробіл (`d` у «d базу»): якщо наступне слово виправимо, її теж.
+    prev1: Option<Prev1>,
+}
+
+struct PendingLearn {
+    keys: Vec<Key>,
+    /// Розкладка, в якій слово тепер на екрані.
+    lang: Lang,
+    /// Це скасування автоматичного виправлення (вчимо «не чіпати»), а не ручне виправлення.
+    revert: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Prev1 {
+    key: Key,
+    lang: Lang,
 }
 
 #[derive(Clone)]
@@ -104,6 +126,8 @@ struct LastToken {
     shown: Lang,
     /// Пробіл або Tab, який ми набрали після слова (Enter не запам'ятовуємо: у чаті повідомлення вже пішло).
     boundary: u32,
+    /// Слово виправив автомат: подвійний Shift на ньому — це скасування.
+    auto_fixed: bool,
 }
 
 /// Перевірка після виправлення: чи вікно з фокусом справді перейшло на потрібну розкладку.
@@ -167,6 +191,9 @@ impl State {
             told_off: HashSet::new(),
             told_layout: HashSet::new(),
             last_key_at: Instant::now(),
+            pending_learn: None,
+            manual_mid: None,
+            prev1: None,
         }
     }
 
@@ -195,6 +222,38 @@ impl State {
         self.last = None;
         self.shown = None;
         self.last_fix_at = None;
+        self.pending_learn = None;
+        self.manual_mid = None;
+        self.prev1 = None;
+    }
+
+    /// Запам'ятати слово в особистому словнику, якщо воно того варте (вирішує `Dicts::learnable*`).
+    fn learn(&mut self, keys: &[Key], lang: Lang, how: &'static str) {
+        if is_sensitive(&self.fg_exe) {
+            return; // термінали, менеджери паролів, VPN: звідти нічого не вчимо
+        }
+        let word = if how == "revert" { self.dicts.learnable_revert(keys, lang) } else { self.dicts.learnable(keys, lang) };
+        let Some(word) = word else { return };
+        self.dicts.add_word(lang, &word);
+        if log_enabled() {
+            let exe = self.fg_exe.clone();
+            with_log(|lg| {
+                let mut f: Vec<(&str, String)> =
+                    vec![("how", how.to_string()), ("lang", format!("{lang:?}")), ("exe", exe)];
+                if lg.words {
+                    f.push(("word", word.clone()));
+                }
+                lg.line("learned", &f);
+            });
+        }
+        learned::save(lang, word);
+    }
+
+    /// Користувач пішов далі після ручного перенесення слова — тепер його можна запам'ятати.
+    fn commit_learn(&mut self) {
+        if let Some(p) = self.pending_learn.take() {
+            self.learn(&p.keys, p.lang, if p.revert { "revert" } else { "manual" });
+        }
     }
 
     /// Стан CapsLock.
@@ -495,6 +554,9 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
         let keys = st.keys.clone();
         let job = st.manual_token(src, "word", &keys, shown, None, hkl_now);
         st.shown = Some(job.to); // слово лишається в буфері; наступні клавіші друкуються вже в новій розкладці
+        // Повторний Shift посеред того самого слова повертає як було — тоді вчити нічого.
+        st.manual_mid = if st.manual_mid.is_some() { None } else { Some(job.to) };
+        st.prev1 = None;
         return Some(job);
     }
 
@@ -503,7 +565,14 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
         let job = st.manual_token(src, "last", &last.keys, last.shown, Some(last.boundary), hkl_now);
         if let Some(l) = st.last.as_mut() {
             l.shown = job.to; // повторне натискання перемкне назад
+            l.auto_fixed = false;
         }
+        // Повторне натискання на тому самому слові повертає як було: користувач передумав — нічого не вчимо.
+        st.pending_learn = match st.pending_learn.take() {
+            Some(_) => None,
+            None => Some(PendingLearn { keys: last.keys.clone(), lang: job.to, revert: last.auto_fixed }),
+        };
+        st.prev1 = None;
         return Some(job);
     }
 
@@ -561,6 +630,10 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
     if t.fg as usize != st.fg {
         enter_window(st, t);
     }
+    // Слова з виправлення виділеного (фоновий потік) — перевірити словниками й, можливо, запам'ятати.
+    for (keys, lang) in learned::take_offers() {
+        st.learn(&keys, lang, "selection");
+    }
     if st.mode != AppMode::Normal {
         st.dshift.on_other();
         return None;
@@ -616,14 +689,19 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
         st.keys.clear();
         st.last = None;
         st.last_fix_at = None;
+        st.pending_learn = None;
+        st.manual_mid = None;
+        st.prev1 = None;
         return None;
     }
 
     match vk {
         PAUSE => manual(st, "pause"), // Pause/Break — те саме, що подвійний Shift (запасна клавіша)
         BACK => {
+            st.pending_learn = None; // стирає щойно перенесене — значить, не те
             if st.keys.is_empty() {
                 st.last = None; // стерли щось перед курсором — «останнє слово» більше не під курсором
+                st.prev1 = None;
                 st.log_undo("backspace");
             } else {
                 st.keys.pop();
@@ -631,7 +709,10 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             None
         }
         SPACE | RETURN | TAB => {
+            st.commit_learn();
             let keys = std::mem::take(&mut st.keys);
+            let mid = st.manual_mid.take();
+            let prev = st.prev1.take();
             if keys.is_empty() {
                 return None;
             }
@@ -651,19 +732,39 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                 _ => None,
             };
             // Запам'ятовуємо слово, щоб подвійний Shift міг виправити (або скасувати виправлення) вже після пробілу.
-            st.last =
-                if vk == RETURN { None } else { Some(LastToken { keys: keys.clone(), shown: to.unwrap_or(cur), boundary: vk }) };
+            st.last = if vk == RETURN {
+                None
+            } else {
+                Some(LastToken { keys: keys.clone(), shown: to.unwrap_or(cur), boundary: vk, auto_fixed: to.is_some() })
+            };
+            // Слово, яке переносили вручну посеред набору, дописано: запам'ятаємо, коли користувач піде далі.
+            if mid == Some(cur) && to.is_none() {
+                st.pending_learn = Some(PendingLearn { keys: keys.clone(), lang: cur, revert: false });
+            }
+            // Одна літера й пробіл: може знадобитись, якщо наступне слово виправлятимемо («d базу» -> «в базу»).
+            // Не тоді, коли перед нею розкладку перемкнули самі: це свідомо набрана літера («диск D»).
+            if keys.len() == 1 && vk == SPACE && matches!(out.verdict, Verdict::Short) && !out.switched_by_user {
+                st.prev1 = Some(Prev1 { key: keys[0], lang: cur });
+            }
             match out.verdict {
                 Verdict::Fix(fix) => {
                     st.last_fix_at = Some(Instant::now());
                     let hkl = out.switch_to.map(|l| st.hkl(l));
-                    Some(Job { back: keys.len(), text: fix.text, boundary: Some(vk), to: fix.to, hkl })
+                    let (mut back, mut text) = (keys.len(), fix.text);
+                    if let Some(letter) = prev.filter(|p| p.lang == cur).and_then(|p| single_letter_fix(p.key, cur)) {
+                        back += 2; // літера й пробіл після неї
+                        text = format!("{letter} {text}");
+                        st.last = None; // «останнє слово» тепер із двох — повторний Shift не вгадає, що повертати
+                        log_event("prev_letter", vec![("exe", st.fg_exe.clone()), ("to", format!("{:?}", fix.to))]);
+                    }
+                    Some(Job { back, text, boundary: Some(vk), to: fix.to, hkl })
                 }
                 _ => None,
             }
         }
         v if is_tracked_key(v) => {
             if st.keys.is_empty() {
+                st.commit_learn(); // попереднє перенесене слово так і лишилось — запам'ятовуємо
                 st.last = None; // почалось нове слово
                 st.shown = win::layout_now().0; // у якій розкладці воно набирається
             }
@@ -677,6 +778,9 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             st.keys.clear();
             st.last = None;
             st.last_fix_at = None;
+            st.pending_learn = None;
+            st.manual_mid = None;
+            st.prev1 = None;
             None
         }
     }

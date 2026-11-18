@@ -19,6 +19,7 @@
 mod autostart;
 mod engine;
 mod http;
+mod learned;
 mod logger;
 mod selection;
 mod settings;
@@ -130,13 +131,15 @@ fn run(opts: Options) {
         return;
     }
 
-    let dicts = match Dicts::load() {
+    let mut dicts = match Dicts::load() {
         Ok(d) => d,
         Err(e) => fail(&format!("Не вдалося завантажити словники: {e}\n\nТека dict\\ має лежати поруч з layout-switcher.exe.")),
     };
     let (n_en, n_uk) = dicts.len();
     let n_forms = dicts.forms_len();
     let n_it = dicts.it_len();
+    // Слова, які програма вивчила з ручних виправлень (%APPDATA%\layout-switcher\learned_*.txt).
+    let (n_learned_en, n_learned_uk) = learned::load_into(&mut dicts);
 
     let rules = beside_exe("apps-off.txt")
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -165,6 +168,8 @@ fn run(opts: Options) {
             ("dict_uk", n_uk.to_string()),
             ("dict_uk_forms", n_forms.to_string()),
             ("dict_it", n_it.to_string()),
+            ("learned_en", n_learned_en.to_string()),
+            ("learned_uk", n_learned_uk.to_string()),
             ("installed", installed.replace(", ", ",")),
             ("hkl_en", hkl_hex(hkl_en)),
             ("hkl_uk", hkl_hex(hkl_uk)),
