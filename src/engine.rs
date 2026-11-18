@@ -26,6 +26,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, KillTimer, SetTimer};
 
 use crate::learned;
+use crate::{appsoff, password};
 use crate::logger::{log_enabled, log_event, say, with_log};
 use crate::selection;
 use crate::win::{self, down, hkl_hex, key_input, tap};
@@ -103,6 +104,13 @@ pub(crate) struct State {
     manual_mid: Option<Lang>,
     /// Попереднє слово — одна літера, а за нею пробіл (`d` у «d базу»): якщо наступне слово виправимо, її теж.
     prev1: Option<Prev1>,
+    /// Слово вже перенесли в цю розкладку посеред набору (ми або подвійний Shift). Поки вікно не перемкнуло
+    /// розкладку, наступні літери друкуємо самі — інакше вийшло б «приdsn».
+    carry: Option<Lang>,
+    /// У цьому слові спрацювало виправлення посеред слова.
+    early_word: bool,
+    /// Номер змін списку «не працювати в застосунку» (appsoff.rs), за яким складено `rules`.
+    apps_gen: u32,
 }
 
 struct PendingLearn {
@@ -194,6 +202,9 @@ impl State {
             pending_learn: None,
             manual_mid: None,
             prev1: None,
+            carry: None,
+            early_word: false,
+            apps_gen: u32::MAX,
         }
     }
 
@@ -225,12 +236,59 @@ impl State {
         self.pending_learn = None;
         self.manual_mid = None;
         self.prev1 = None;
+        self.carry = None;
+        self.early_word = false;
+    }
+
+    /// Виправлення посеред слова (`Dicts::early_fix`): викликається після кожної літери, з третьої.
+    unsafe fn try_early(&mut self) -> Option<Job> {
+        if self.keys.len() < 3 || self.manual_mid.is_some() || is_sensitive(&self.fg_exe) {
+            return None;
+        }
+        let (lang, _) = win::layout_now();
+        let cur = self.shown.or(lang)?;
+        let fix = self.dicts.early_fix(&self.keys, cur, self.session.ctx())?;
+        if !password::safe_to_fix(self.fg as HWND) {
+            log_event("password_skip", vec![("exe", self.fg_exe.clone()), ("at", "early".into()), ("why", password::why(self.fg as HWND).into())]);
+            return None;
+        }
+        let mut back = self.keys.len() - 1; // останню літеру ми «з'їли» — її на екрані ще нема
+        let mut text = fix.text.clone();
+        if let Some(letter) = self.prev1.take().filter(|p| p.lang == cur).and_then(|p| single_letter_fix(p.key, cur)) {
+            back += 2;
+            text = format!("{letter} {text}");
+            log_event("prev_letter", vec![("exe", self.fg_exe.clone()), ("to", format!("{:?}", fix.to))]);
+        }
+        if log_enabled() {
+            let exe = self.fg_exe.clone();
+            let ctx = self.session.ctx().map(|l| format!("{l:?}")).unwrap_or_else(|| "-".into());
+            let typed = render(&self.keys, cur);
+            let n = self.keys.len();
+            with_log(|lg| {
+                let mut f: Vec<(&str, String)> = vec![
+                    ("exe", exe),
+                    ("ctx", ctx),
+                    ("cur", format!("{cur:?}")),
+                    ("to", format!("{:?}", fix.to)),
+                    ("len", n.to_string()),
+                ];
+                if lg.words && !looks_secret(&typed) {
+                    f.push(("typed", typed));
+                    f.push(("other", fix.text.clone()));
+                }
+                lg.line("early", &f);
+            });
+        }
+        self.carry = Some(fix.to);
+        self.shown = Some(fix.to);
+        self.early_word = true;
+        Some(Job { back, text, boundary: None, to: fix.to, hkl: Some(self.hkl(fix.to)) })
     }
 
     /// Запам'ятати слово в особистому словнику, якщо воно того варте (вирішує `Dicts::learnable*`).
     fn learn(&mut self, keys: &[Key], lang: Lang, how: &'static str) {
-        if is_sensitive(&self.fg_exe) {
-            return; // термінали, менеджери паролів, VPN: звідти нічого не вчимо
+        if is_sensitive(&self.fg_exe) || password::is_password(self.fg as HWND) {
+            return; // термінали, менеджери паролів, VPN, поля паролів: звідти нічого не вчимо
         }
         let word = if how == "revert" { self.dicts.learnable_revert(keys, lang) } else { self.dicts.learnable(keys, lang) };
         let Some(word) = word else { return };
@@ -276,7 +334,7 @@ impl State {
             return;
         }
         let exe = self.fg_exe.clone();
-        let masked = is_sensitive(&exe);
+        let masked = is_sensitive(&exe) || password::is_password(self.fg as HWND);
         let tag = out.map_or("no_lang", |o| o.verdict.tag());
         let to = out.and_then(|o| match &o.verdict {
             Verdict::Fix(f) => Some(f.to),
@@ -554,6 +612,7 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
         let keys = st.keys.clone();
         let job = st.manual_token(src, "word", &keys, shown, None, hkl_now);
         st.shown = Some(job.to); // слово лишається в буфері; наступні клавіші друкуються вже в новій розкладці
+        st.carry = Some(job.to);
         // Повторний Shift посеред того самого слова повертає як було — тоді вчити нічого.
         st.manual_mid = if st.manual_mid.is_some() { None } else { Some(job.to) };
         st.prev1 = None;
@@ -598,7 +657,9 @@ unsafe fn enter_window(st: &mut State, t: win::Target) {
     st.reset_word();
     st.session.reset();
     st.fg_exe = win::exe_of(t.fg);
+    appsoff::set_current(&st.fg_exe);
     st.mode = st.rules.mode(&st.fg_exe);
+    password::ask(t.fg, true);
     if log_enabled() {
         let mut f = vec![("exe", st.fg_exe.clone())];
         if t.focus != t.fg {
@@ -620,6 +681,7 @@ unsafe fn enter_window(st: &mut State, t: win::Target) {
                     st.fg_exe
                 ),
                 OffReason::UserList => format!("{}: вимкнено в apps-off.txt — тут не втручаюсь.", st.fg_exe),
+                OffReason::Menu => format!("{}: вимкнено в меню значка — тут не втручаюсь.", st.fg_exe),
             });
         }
     }
@@ -627,6 +689,15 @@ unsafe fn enter_window(st: &mut State, t: win::Target) {
 
 unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
     let t = win::target();
+    // Список «не працювати в застосунку» змінили з меню — перечитати й одразу застосувати до поточного вікна.
+    let gen = appsoff::generation();
+    if gen != st.apps_gen {
+        st.apps_gen = gen;
+        st.rules.set_menu_list(&appsoff::read());
+        if t.fg as usize == st.fg {
+            st.fg = 0; // примусово «увійти» у вікно заново: режим, лог, підказка
+        }
+    }
     if t.fg as usize != st.fg {
         enter_window(st, t);
     }
@@ -713,33 +784,54 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             let keys = std::mem::take(&mut st.keys);
             let mid = st.manual_mid.take();
             let prev = st.prev1.take();
+            let carried = st.carry.take();
+            let early = std::mem::take(&mut st.early_word);
             if keys.is_empty() {
                 return None;
             }
             st.shown = None;
             let (lang, hkl_now) = win::layout_now();
-            let Some(cur) = lang else {
+            // Якщо слово переносили посеред набору, на екрані воно в тій розкладці, навіть коли вікно її не ввімкнуло.
+            let Some(cur) = carried.or(lang) else {
                 st.last = None;
                 st.log_word(&keys, None, hkl_now, None);
                 return None;
             };
-            st.remember(cur, hkl_now);
+            if lang == Some(cur) {
+                st.remember(cur, hkl_now);
+            }
             let now = st.now_ms();
             let out = st.session.on_word(&st.dicts, &keys, cur, now);
             st.log_word(&keys, Some(cur), hkl_now, Some(&out));
-            let to = match &out.verdict {
+            let mut to = match &out.verdict {
                 Verdict::Fix(f) => Some(f.to),
                 _ => None,
             };
+            // Розкладку цього слова користувач обрав сам (подвійний Shift посеред слова) — не сперечаємось.
+            if to.is_some() && mid == Some(cur) {
+                to = None;
+                log_event("kept_manual", vec![("exe", st.fg_exe.clone())]);
+            }
+            // Поле пароля: нічого не виправляємо.
+            if to.is_some() && !password::safe_to_fix(st.fg as HWND) {
+                to = None;
+                log_event("password_skip", vec![("exe", st.fg_exe.clone()), ("at", "word".into()), ("why", password::why(st.fg as HWND).into())]);
+            }
             // Запам'ятовуємо слово, щоб подвійний Shift міг виправити (або скасувати виправлення) вже після пробілу.
             st.last = if vk == RETURN {
                 None
             } else {
-                Some(LastToken { keys: keys.clone(), shown: to.unwrap_or(cur), boundary: vk, auto_fixed: to.is_some() })
+                Some(LastToken {
+                    keys: keys.clone(),
+                    shown: to.unwrap_or(cur),
+                    boundary: vk,
+                    auto_fixed: to.is_some() || (early && mid.is_none()),
+                })
             };
             // Слово, яке переносили вручну посеред набору, дописано: запам'ятаємо, коли користувач піде далі.
+            // Якщо до того його переносив автомат — це скасування: вчимо «не чіпати».
             if mid == Some(cur) && to.is_none() {
-                st.pending_learn = Some(PendingLearn { keys: keys.clone(), lang: cur, revert: false });
+                st.pending_learn = Some(PendingLearn { keys: keys.clone(), lang: cur, revert: early });
             }
             // Одна літера й пробіл: може знадобитись, якщо наступне слово виправлятимемо («d базу» -> «в базу»).
             // Не тоді, коли перед нею розкладку перемкнули самі: це свідомо набрана літера («диск D»).
@@ -747,7 +839,7 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                 st.prev1 = Some(Prev1 { key: keys[0], lang: cur });
             }
             match out.verdict {
-                Verdict::Fix(fix) => {
+                Verdict::Fix(fix) if to.is_some() => {
                     st.last_fix_at = Some(Instant::now());
                     let hkl = out.switch_to.map(|l| st.hkl(l));
                     let (mut back, mut text) = (keys.len(), fix.text);
@@ -767,11 +859,21 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                 st.commit_learn(); // попереднє перенесене слово так і лишилось — запам'ятовуємо
                 st.last = None; // почалось нове слово
                 st.shown = win::layout_now().0; // у якій розкладці воно набирається
+                st.carry = None;
+                st.early_word = false;
+                password::ask(t.fg, false); // поки набирається слово, дізнаємось, чи це не поле пароля
             }
             let key = Key { vk: v, shift: down(VK_SHIFT), caps: st.caps_now() };
             st.keys.push(key);
             st.last_fix_at = None;
-            None
+            // Розкладку посеред слова вже перемкнули, а вікно ще не встигло (або не вміє): літеру друкуємо самі.
+            if let Some(to) = st.carry {
+                if win::layout_now().0 != Some(to) {
+                    return Some(Job { back: 0, text: render(&[key], to), boundary: None, to, hkl: None });
+                }
+                return None;
+            }
+            st.try_early()
         }
         _ => {
             // стрілки, Home/End, Esc, Delete, F-клавіші, numpad, VK_PACKET... — позиція змінилась

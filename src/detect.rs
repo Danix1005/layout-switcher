@@ -16,11 +16,12 @@
 //!
 //! Слова з цифрами й дефісом (`KIT005`, `start-config`) розбираються по сегментах між цифрами/дефісами.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
-use fst::Set;
+use fst::{IntoStreamer, Set, Streamer};
 
 use crate::keymap::{char_for, convert, is_tracked_key, render, Key, Lang};
 use crate::privacy::looks_secret;
@@ -34,6 +35,14 @@ const RANK_USER: u32 = 500;
 const RANK_IT: u32 = 1500;
 /// Слово з рангом від цього значення вважаємо «шумовим» (хвіст корпусу): його можна перебити частотнішим словом іншої мови.
 const NOISE_RANK: u32 = 20_000;
+/// Виправлення посеред слова: щонайменше стільки літер (менше — надто часто збігається випадково) і не більше
+/// стільки (довге слово, яке досі «не впізнали», нехай перевірить пробіл).
+const EARLY_MIN: usize = 3;
+const EARLY_MAX: usize = 12;
+/// Скільки слів з однаковим початком переглядати, шукаючи частотне (щоб не гальмувати хук).
+const EARLY_SCAN: usize = 400;
+/// Укр. частотний список шумніший за англ., зате довший: межа «частого» слова для виправлення посеред слова.
+const EARLY_RANK_UK: u32 = 30_000;
 /// У скільки разів частотнішим має бути слово іншої мови, щоб перебити «шумове»
 /// (і наскільки рідшим воно може бути, щоб контекст усе ще вирішував на його користь).
 const RANK_MARGIN: u32 = 4;
@@ -68,8 +77,9 @@ const AMBIGUOUS_SHORT: &[(&str, &str)] = &[("шт", "in"), ("см", "cv"), ("ш�
 
 pub struct Dicts {
     /// слово -> ранг частотності (0 = найчастіше)
-    en: HashMap<String, u32>,
-    uk: HashMap<String, u32>,
+    /// (упорядковано — щоб швидко шукати слова за початком, див. `early_fix`)
+    en: BTreeMap<String, u32>,
+    uk: BTreeMap<String, u32>,
     short_en: HashSet<String>,
     short_uk: HashSet<String>,
     /// Усі українські словоформи (морфологічний словник); може бракувати — тоді працюємо без нього.
@@ -117,8 +127,8 @@ impl Dicts {
     /// Слова беруться в порядку частотності: ранг = номер у списку.
     fn from_lists(en: Vec<String>, uk: Vec<String>) -> Self {
         let mut d = Dicts {
-            en: HashMap::new(),
-            uk: HashMap::new(),
+            en: BTreeMap::new(),
+            uk: BTreeMap::new(),
             short_en: SHORT_EN.iter().map(|s| s.to_string()).collect(),
             short_uk: SHORT_UK.iter().map(|s| s.to_string()).collect(),
             forms: None,
@@ -298,7 +308,7 @@ impl Dicts {
         if self.is_explicit(lang, word) {
             return true;
         }
-        let top = |m: &HashMap<String, u32>| m.get(word).map_or(false, |&r| r < NOISE_RANK);
+        let top = |m: &BTreeMap<String, u32>| m.get(word).map_or(false, |&r| r < NOISE_RANK);
         match lang {
             Lang::En => top(&self.en),
             // без морфологічного індексу (файл відсутній) лишається тільки частота
@@ -455,6 +465,71 @@ impl Dicts {
             Verdict::Fix(f) => Some(f),
             _ => None,
         }
+    }
+
+    /// Чи починається з `prefix` хоч одне слово мови, яке ми знаємо (частотний список, особисті й вивчені слова,
+    /// для української — ще й 3,4 млн словоформ). `prefix` — малими літерами.
+    pub fn has_prefix(&self, lang: Lang, prefix: &str) -> bool {
+        let map = match lang {
+            Lang::En => &self.en,
+            Lang::Uk => &self.uk,
+        };
+        let in_map = map.range::<str, _>((Bound::Included(prefix), Bound::Unbounded)).next().is_some_and(|(w, _)| w.starts_with(prefix));
+        in_map
+            || (lang == Lang::Uk
+                && self.forms.as_ref().is_some_and(|f| {
+                    let mut st = f.range().ge(prefix.as_bytes()).into_stream();
+                    st.next().is_some_and(|w| w.starts_with(prefix.as_bytes()))
+                }))
+    }
+
+    /// Чи починається з `prefix` хоч одне ЧАСТЕ й надійне слово мови (не шум корпусу): англ. — з першої
+    /// 20-тисячки, укр. — з першої 30-тисячки й підтверджене морфологічним словником; або додане явно.
+    pub fn has_frequent_prefix(&self, lang: Lang, prefix: &str) -> bool {
+        let (map, limit) = match lang {
+            Lang::En => (&self.en, NOISE_RANK),
+            Lang::Uk => (&self.uk, EARLY_RANK_UK),
+        };
+        map.range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(w, _)| w.starts_with(prefix))
+            .take(EARLY_SCAN)
+            .any(|(w, &r)| self.is_explicit(lang, w) || (r < limit && self.solid(lang, w)))
+    }
+
+    /// Слово ще набирається, а вже видно, що не в тій розкладці: з набраних літер не починається жодне слово
+    /// мови `cur` (`ghb…`), зате в іншій це початок частого слова («при…»). Тоді перемикаємо розкладку одразу —
+    /// решту слова людина набере вже правильно. Повертає, чим замінити набране (без правил для розділових
+    /// знаків на краях: слово ще не скінчилось). `ctx` — мова останніх слів: якщо це `cur`, а слово схоже на
+    /// іншу мову — це «вкраплене» слово (англійський термін в українському тексті), його виправить пробіл.
+    pub fn early_fix(&self, keys: &[Key], cur: Lang, ctx: Option<Lang>) -> Option<Fix> {
+        if keys.len() < EARLY_MIN || keys.len() > EARLY_MAX || ctx == Some(cur) {
+            return None;
+        }
+        if keys.iter().any(|k| !is_tracked_key(k.vk) || is_separator(k) || matches!(k.vk, 0xBB | 0xDC)) {
+            return None;
+        }
+        let to = cur.other();
+        let typed = render(keys, cur);
+        let text = render(keys, to);
+        // Обидва прочитання мають бути «словом»: літери (і апостроф не на початку). Лапки, дужки, `.` `,` —
+        // ні, крім клавіш, які в українській розкладці — літери (б ю ж х ї: так починаються «буде», «юрист»).
+        let wordish = |s: &str, keys_are_uk_letters: bool| {
+            s.chars().enumerate().all(|(i, c)| {
+                c.is_alphabetic()
+                    || (i > 0 && matches!(c, '\'' | 'ʼ' | '`'))
+                    || (keys_are_uk_letters && matches!(c, ',' | '.' | ';' | '[' | ']'))
+            })
+        };
+        if !wordish(&typed, cur == Lang::En) || !wordish(&text, false) {
+            return None;
+        }
+        let t = typed.to_lowercase();
+        let c = text.to_lowercase();
+        if looks_secret(&typed) || self.has_prefix(cur, &t) || !self.has_frequent_prefix(to, &c) {
+            return None;
+        }
+        // Уся комбінація — частий початок і в рідній мові без апострофа/дефіса? (`зявл…`) — has_prefix це врахував.
+        Some(Fix { text, to })
     }
 
     /// Адреса сайту або пошти, набрана в українській розкладці (`аучютуе` -> `fex.net`,
@@ -1195,7 +1270,7 @@ mod tests {
     #[test]
     fn real_dictionaries_recall_and_collisions() {
         let Ok(d) = Dicts::load() else { return };
-        let sample = |set: &HashMap<String, u32>, lang: Lang, wrong: Lang| {
+        let sample = |set: &BTreeMap<String, u32>, lang: Lang, wrong: Lang| {
             let (mut total, mut fixed) = (0u32, 0u32);
             for w in set.keys().filter(|w| w.chars().count() >= MIN_LEN).step_by(7) {
                 let Some(keys) = keys_for(w, lang) else { continue };
@@ -1318,5 +1393,53 @@ mod tests {
         // літера, яка ніде не слово
         assert_eq!(single_letter_fix(k("x", Lang::En), Lang::En), None);
         assert_eq!(single_letter_fix(k("5", Lang::En), Lang::En), None);
+    }
+
+    // ── 0.9.2: виправлення посеред слова ──
+
+    #[test]
+    fn early_fix_after_three_letters() {
+        let d = Dicts::from_words(["windows", "the", "there"], ["привіт", "буде"]);
+        let f = d.early_fix(&typed("ghb", Lang::En), Lang::En, None).unwrap();
+        assert_eq!((f.text.as_str(), f.to), ("при", Lang::Uk));
+        let f = d.early_fix(&typed("Цшт", Lang::Uk), Lang::Uk, Some(Lang::En)).unwrap();
+        assert_eq!((f.text.as_str(), f.to), ("Win", Lang::En));
+        // «б» на клавіші коми: ,eltn -> буде
+        assert_eq!(d.early_fix(&typed(",el", Lang::En), Lang::En, None).unwrap().text, "буд");
+    }
+
+    #[test]
+    fn early_fix_stays_quiet_when_unsure() {
+        let d = Dicts::from_words(["windows", "the", "there"], ["привіт"]);
+        // дві літери — замало
+        assert!(d.early_fix(&typed("gh", Lang::En), Lang::En, None).is_none());
+        // з такого початку є слово поточної мови
+        assert!(d.early_fix(&typed("the", Lang::En), Lang::En, None).is_none());
+        // вкраплене слово (останні слова — поточною мовою): виправить пробіл, розкладку не перемикаючи
+        assert!(d.early_fix(&typed("ghb", Lang::En), Lang::En, Some(Lang::En)).is_none());
+        // в іншій мові такого частого початку нема
+        assert!(d.early_fix(&typed("qzx", Lang::En), Lang::En, None).is_none());
+        // цифри, дефіс, лапки — не слово
+        assert!(d.early_fix(&typed("gh1", Lang::En), Lang::En, None).is_none());
+        assert!(d.early_fix(&typed("\"gh", Lang::En), Lang::En, None).is_none());
+        // рідкісне (шумове) слово іншої мови — не привід
+        let noisy = Dicts::from_words(["the"], []).with_rank(Lang::Uk, "приклад", 90_000);
+        assert!(noisy.early_fix(&typed("ghb", Lang::En), Lang::En, None).is_none());
+    }
+
+    #[test]
+    fn learned_word_blocks_early_fix() {
+        let mut d = Dicts::from_words(["the"], ["привіт"]);
+        assert!(d.early_fix(&typed("ghbdsn", Lang::En), Lang::En, None).is_some());
+        d.add_word(Lang::En, "ghbx"); // вивчене «не чіпати»
+        assert!(d.early_fix(&typed("ghb", Lang::En), Lang::En, None).is_none());
+    }
+
+    #[test]
+    fn prefix_lookup_uses_morphology_too() {
+        let d = Dicts::from_words(["the"], []).with_forms_from(["приклад"]);
+        assert!(d.has_prefix(Lang::Uk, "прик"));
+        assert!(!d.has_prefix(Lang::Uk, "прж"));
+        assert!(d.has_prefix(Lang::En, "th"));
     }
 }

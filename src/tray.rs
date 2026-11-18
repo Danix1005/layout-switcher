@@ -31,7 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::logger::log_event;
-use crate::{autostart, engine, logger, settings, updater, win};
+use crate::{appsoff, autostart, engine, logger, settings, updater, win};
+use layout_switcher::apps::{AppMode, AppRules, OffReason};
 use layout_switcher::cli::quote_command;
 
 /// Ім'я класу вікна значка: за ним `--pause` / `--resume` / `--exit` знаходять запущену програму.
@@ -49,6 +50,7 @@ const CMD_LOG_PLAIN: usize = 1011;
 const CMD_LOG_WORDS: usize = 1012;
 const CMD_OPEN_LOG: usize = 1013;
 const CMD_OPEN_LEARNED: usize = 1014;
+const CMD_APP_OFF: usize = 1015;
 const CMD_AUTOSTART: usize = 1020;
 const CMD_UPDATE_CHECK: usize = 1030;
 const CMD_UPDATE_AUTO: usize = 1031;
@@ -322,6 +324,15 @@ unsafe fn show_menu(hwnd: HWND) {
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     item(menu, MF_STRING, CMD_TOGGLE, if enabled { "Призупинити автовиправлення" } else { "Відновити автовиправлення" });
+    // Застосунок, у якому щойно набирали текст: вимкнути/ввімкнути саме в ньому.
+    if let Some(exe) = appsoff::current() {
+        match app_state(&exe) {
+            AppState::Remote => item(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, &format!("{exe}: віддалений доступ — не втручаюсь")),
+            AppState::FileList => item(menu, MF_STRING | MF_CHECKED | MF_GRAYED | MF_DISABLED, 0, &format!("Не працювати в {exe} (apps-off.txt)")),
+            AppState::Menu => item(menu, MF_STRING | MF_CHECKED, CMD_APP_OFF, &format!("Не працювати в {exe}")),
+            AppState::On => item(menu, MF_STRING, CMD_APP_OFF, &format!("Не працювати в {exe}")),
+        }
+    }
 
     let log_menu = CreatePopupMenu();
     item(log_menu, checked(!log_on), CMD_LOG_OFF, "Вимкнено");
@@ -380,6 +391,7 @@ unsafe fn command(hwnd: HWND, id: usize) {
         }
         CMD_OPEN_LOG => open_log_folder(),
         CMD_OPEN_LEARNED => open_learned(),
+        CMD_APP_OFF => toggle_app(),
         CMD_AUTOSTART => toggle_autostart(),
         CMD_UPDATE_CHECK => updater::check_now(true),
         CMD_UPDATE_INSTALL => updater::install(),
@@ -425,6 +437,46 @@ unsafe fn open_log_folder() {
             with_tray(|t| balloon(t, "Логу ще нема", "Увімкни запис логу в меню — файл з'явиться поруч з програмою."));
         }
     }
+}
+
+enum AppState {
+    On,
+    Menu,
+    FileList,
+    Remote,
+}
+
+fn app_state(exe: &str) -> AppState {
+    let mut rules = beside_exe_rules();
+    if let AppMode::Off(OffReason::UserList) = rules.mode(exe) {
+        return AppState::FileList;
+    }
+    rules.set_menu_list(&appsoff::read());
+    match rules.mode(exe) {
+        AppMode::Off(OffReason::Menu) => AppState::Menu,
+        AppMode::Off(_) => AppState::Remote,
+        AppMode::Normal => AppState::On,
+    }
+}
+
+/// Правила з `apps-off.txt` поруч із програмою (лише щоб показати в меню, звідки вимкнено).
+fn beside_exe_rules() -> AppRules {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p.with_file_name("apps-off.txt")).ok())
+        .map(|t| AppRules::from_user_list(&t))
+        .unwrap_or_default()
+}
+
+unsafe fn toggle_app() {
+    let Some(exe) = appsoff::current() else { return };
+    let (title, text) = match appsoff::toggle(&exe) {
+        Ok(true) => (format!("Вимкнено в {exe}"), "Тут більше нічого не виправляю. Увімкнути — тим самим пунктом меню.".to_string()),
+        Ok(false) => (format!("Знову працюю в {exe}"), "Автовиправлення в цьому застосунку ввімкнено.".to_string()),
+        Err(e) => ("Не вдалося змінити список".to_string(), format!("%APPDATA%\\layout-switcher\\apps-off.txt: {e}")),
+    };
+    crate::logger::log_event("app_off", vec![("exe", exe.clone()), ("result", title.clone())]);
+    with_tray(|t| balloon(t, &title, &text));
 }
 
 /// Провідник із виділеним файлом вивчених слів (файли створюються, якщо їх ще нема).

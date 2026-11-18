@@ -19,7 +19,9 @@
 mod autostart;
 mod engine;
 mod http;
+mod appsoff;
 mod learned;
+mod password;
 mod logger;
 mod selection;
 mod settings;
@@ -187,6 +189,7 @@ fn run(opts: Options) {
             logger::log_start(opts.log_words, "args");
         }
 
+        password::start(); // фоновий потік: чи не стоїть курсор у полі пароля
         engine::init(engine::State::new(
             dicts,
             rules,
