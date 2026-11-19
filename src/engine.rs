@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use layout_switcher::apps::{is_sensitive, AppMode, AppRules, OffReason};
 use layout_switcher::detect::{single_letter_fix, Dicts, Verdict};
+use layout_switcher::keymap::is_key_run;
 use layout_switcher::hotkey::DoubleShift;
 use layout_switcher::inject::InjectedPolicy;
 use layout_switcher::keymap::{convert, is_tracked_key, render, Key, Lang};
@@ -117,7 +118,23 @@ pub(crate) struct State {
     quick_revert: bool,
     /// У цьому слові вже записали `password_skip` (щоб не писати на кожну літеру).
     pw_logged: bool,
+    /// Скан-код попередньої натиснутої клавіші і скільки разів поспіль він зростав рівно на 1.
+    sc_prev: u32,
+    sc_run: u32,
+    /// Скільки натискань поспіль скан-коди йшли «звичайно» (не лічильником).
+    sc_normal: u32,
+    /// У цьому вікні натискання приховано: хук бачить не справжні клавіші, а лічильник (`йцукен…`, `фіва…`) —
+    /// так антивіруси «захищають» браузер від кейлогерів (ESET «Захист банківських операцій і платежів»).
+    hidden: bool,
+    /// Чи вже казали про це користувачеві (раз за запуск).
+    hidden_told: bool,
 }
+
+/// Стільки зростань скан-коду рівно на 1 поспіль (тобто 7 клавіш підряд по порядку на клавіатурі) —
+/// і ми вважаємо, що натискання в цьому вікні підмінено. Людина так не друкує.
+const HIDDEN_RUN: u32 = 6;
+/// Стільки «звичайних» натискань поспіль — і підміни вже нема.
+const VISIBLE_AGAIN: u32 = 12;
 
 /// Подвійний Shift раніше, ніж за стільки після автоматичного виправлення, — це не «скасувати»: людина
 /// помітила не ту розкладку й потягнулась виправляти, а ми встигли першими. Такий Shift нічого не робить.
@@ -223,6 +240,11 @@ impl State {
             auto_fix_at: None,
             quick_revert: false,
             pw_logged: false,
+            sc_prev: 0,
+            sc_run: 0,
+            sc_normal: 0,
+            hidden: false,
+            hidden_told: false,
         }
     }
 
@@ -258,6 +280,39 @@ impl State {
         self.early_word = false;
         self.quick_revert = false;
         self.pw_logged = false;
+    }
+
+    /// Стежимо, чи не підмінено натискання: справжні клавіші хук бачить як лічильник скан-кодів
+    /// (0x15, 0x16, 0x17… — `yuiop[]` замість набраного `welcome`), а застосунок отримує правильні літери.
+    fn watch_scancodes(&mut self, sc: u32) {
+        if sc == self.sc_prev + 1 {
+            self.sc_run += 1;
+            self.sc_normal = 0;
+        } else {
+            self.sc_run = 0;
+            self.sc_normal += 1;
+        }
+        self.sc_prev = sc;
+        if !self.hidden && self.sc_run >= HIDDEN_RUN {
+            self.hidden = true;
+            self.keys.clear();
+            self.last = None;
+            log_event("input_hidden", vec![("exe", self.fg_exe.clone()), ("state", "on".into())]);
+            if !std::mem::replace(&mut self.hidden_told, true) {
+                let exe = self.fg_exe.clone();
+                std::thread::spawn(move || {
+                    crate::tray::notify(
+                        &format!("{exe}: натискання приховано"),
+                        "Схоже, антивірус захищає цей браузер від перехоплення клавіатури (ESET: «Захист банківських \
+                         операцій і платежів»). Автовиправлення тут не працює; подвійний Shift виправляє слово перед \
+                         курсором через виділення.",
+                    )
+                });
+            }
+        } else if self.hidden && self.sc_normal >= VISIBLE_AGAIN {
+            self.hidden = false;
+            log_event("input_hidden", vec![("exe", self.fg_exe.clone()), ("state", "off".into())]);
+        }
     }
 
     /// Скільки мс минуло від останнього автоматичного виправлення.
@@ -483,9 +538,17 @@ pub(crate) fn init(state: State) {
 
 /// Подія клавіатури (не наша власна). Повертає true, якщо клавішу треба «з'їсти»:
 /// ми самі надрукуємо замість неї що треба.
-pub(crate) fn on_key(vk: u32, is_down: bool, is_up: bool, injected: bool) -> bool {
+/// Shift, Ctrl, Alt, Win: антивірус їх не підмінює, і в «лічильник» вони не входять.
+fn is_modifier(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0xA0..=0xA5 | 0x5B | 0x5C | 0x14)
+}
+
+pub(crate) fn on_key(vk: u32, sc: u32, is_down: bool, is_up: bool, injected: bool) -> bool {
     let job = with_state(|st| {
         st.last_key_at = Instant::now();
+        if is_down && !injected && !is_modifier(vk) {
+            st.watch_scancodes(sc);
+        }
 
         // Чужий програмний ввід: обробляти чи ні — вирішує політика (див. inject.rs).
         if is_down && vk != VK_PACKET {
@@ -629,6 +692,13 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
         st.remember(l, hkl_now);
     }
 
+    // Натискання підмінено або буфер схожий на лічильник (`yuiop[]` замість `welcome`): перетворювати те, що ми
+    // «бачили», не можна — це дало б нісенітницю. Беремо справжній текст з екрана: слово перед курсором.
+    if st.hidden || is_key_run(&st.keys, 4) || st.last.as_ref().is_some_and(|l| is_key_run(&l.keys, 4)) {
+        st.keys.clear();
+        st.last = None;
+    }
+
     // 1) слово, яке зараз набирається (ще без пробілу)
     if !st.keys.is_empty() {
         if !st.keys.iter().all(|k| is_tracked_key(k.vk)) {
@@ -701,6 +771,8 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
 unsafe fn enter_window(st: &mut State, t: win::Target) {
     st.fg = t.fg as usize;
     st.reset_word();
+    st.hidden = false; // у новому вікні перевіряємо заново
+    st.sc_run = 0;
     st.session.reset();
     st.fg_exe = win::exe_of(t.fg);
     appsoff::set_current(&st.fg_exe);
@@ -763,6 +835,14 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
         return None;
     }
     st.dshift.on_other(); // будь-яка інша клавіша ламає «чисте» натискання
+
+    // Натискання підмінено (див. watch_scancodes): ми не знаємо, що насправді набрано — нічого не відстежуємо.
+    if st.hidden {
+        st.keys.clear();
+        st.last = None;
+        st.carry = None;
+        return None;
+    }
 
     // Самі модифікатори і CapsLock слово не рвуть.
     if matches!(vk, 0x10 | 0x11 | 0x12 | 0x14 | 0x5B | 0x5C | 0xA1..=0xA5) {

@@ -332,7 +332,8 @@ unsafe extern "system" fn kb_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             let is_down = wp as u32 == WM_KEYDOWN || wp as u32 == WM_SYSKEYDOWN;
             let is_up = wp as u32 == WM_KEYUP || wp as u32 == WM_SYSKEYUP;
             let vk = kb.vkCode;
-            let swallow = std::panic::catch_unwind(|| engine::on_key(vk, is_down, is_up, injected)).unwrap_or(false);
+            let sc = kb.scanCode;
+            let swallow = std::panic::catch_unwind(|| engine::on_key(vk, sc, is_down, is_up, injected)).unwrap_or(false);
             if swallow {
                 return 1;
             }
