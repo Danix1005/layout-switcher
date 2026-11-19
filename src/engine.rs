@@ -111,7 +111,20 @@ pub(crate) struct State {
     early_word: bool,
     /// Номер змін списку «не працювати в застосунку» (appsoff.rs), за яким складено `rules`.
     apps_gen: u32,
+    /// Коли востаннє виправили слово автоматично (посеред слова або пробілом).
+    auto_fix_at: Option<Instant>,
+    /// Скасування виправлення посеред слова було надто швидким, щоб бути свідомим: не вчимо з нього.
+    quick_revert: bool,
+    /// У цьому слові вже записали `password_skip` (щоб не писати на кожну літеру).
+    pw_logged: bool,
 }
+
+/// Подвійний Shift раніше, ніж за стільки після автоматичного виправлення, — це не «скасувати»: людина
+/// помітила не ту розкладку й потягнулась виправляти, а ми встигли першими. Такий Shift нічого не робить.
+const RACE_MS: u128 = 700;
+/// Скасування посеред слова, швидше за це від виправлення, не вчить «не чіпати» (могла бути та сама гонка,
+/// лише трохи повільніша). Після пробілу досить, щоб від виправлення й від пробілу минуло більше `RACE_MS`.
+const REVERT_LEARN_MS: u128 = 1200;
 
 struct PendingLearn {
     keys: Vec<Key>,
@@ -136,6 +149,8 @@ struct LastToken {
     boundary: u32,
     /// Слово виправив автомат: подвійний Shift на ньому — це скасування.
     auto_fixed: bool,
+    /// Коли слово закінчилось (пробіл).
+    at: Instant,
 }
 
 /// Перевірка після виправлення: чи вікно з фокусом справді перейшло на потрібну розкладку.
@@ -205,6 +220,9 @@ impl State {
             carry: None,
             early_word: false,
             apps_gen: u32::MAX,
+            auto_fix_at: None,
+            quick_revert: false,
+            pw_logged: false,
         }
     }
 
@@ -238,6 +256,13 @@ impl State {
         self.prev1 = None;
         self.carry = None;
         self.early_word = false;
+        self.quick_revert = false;
+        self.pw_logged = false;
+    }
+
+    /// Скільки мс минуло від останнього автоматичного виправлення.
+    fn since_auto_fix(&self) -> u128 {
+        self.auto_fix_at.map_or(u128::MAX, |t| t.elapsed().as_millis())
     }
 
     /// Виправлення посеред слова (`Dicts::early_fix`): викликається після кожної літери, з третьої.
@@ -249,7 +274,10 @@ impl State {
         let cur = self.shown.or(lang)?;
         let fix = self.dicts.early_fix(&self.keys, cur, self.session.ctx())?;
         if !password::safe_to_fix(self.fg as HWND) {
-            log_event("password_skip", vec![("exe", self.fg_exe.clone()), ("at", "early".into()), ("why", password::why(self.fg as HWND).into())]);
+            if !std::mem::replace(&mut self.pw_logged, true) {
+                let why = password::why(self.fg as HWND);
+                log_event("password_skip", vec![("exe", self.fg_exe.clone()), ("at", "early".into()), ("why", why.into())]);
+            }
             return None;
         }
         let mut back = self.keys.len() - 1; // останню літеру ми «з'їли» — її на екрані ще нема
@@ -282,6 +310,8 @@ impl State {
         self.carry = Some(fix.to);
         self.shown = Some(fix.to);
         self.early_word = true;
+        self.auto_fix_at = Some(Instant::now());
+        self.session.expect(fix.to); // розкладку перемкнули ми, а не людина: це не «sw=1»
         Some(Job { back, text, boundary: None, to: fix.to, hkl: Some(self.hkl(fix.to)) })
     }
 
@@ -334,7 +364,7 @@ impl State {
             return;
         }
         let exe = self.fg_exe.clone();
-        let masked = is_sensitive(&exe) || password::is_password(self.fg as HWND);
+        let masked = is_sensitive(&exe) || !password::known_not_password(self.fg as HWND);
         let tag = out.map_or("no_lang", |o| o.verdict.tag());
         let to = out.and_then(|o| match &o.verdict {
             Verdict::Fix(f) => Some(f.to),
@@ -609,6 +639,15 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
             st.log_noop(src, "no_lang");
             return None;
         };
+        // Ми щойно виправили це слово посеред набору, а людина саме тиснула Shift, щоб виправити його сама.
+        let since = st.since_auto_fix();
+        if st.early_word && st.manual_mid.is_none() && since < RACE_MS {
+            st.log_noop(src, "just_fixed");
+            return None;
+        }
+        if st.early_word && st.manual_mid.is_none() {
+            st.quick_revert = since < REVERT_LEARN_MS;
+        }
         let keys = st.keys.clone();
         let job = st.manual_token(src, "word", &keys, shown, None, hkl_now);
         st.shown = Some(job.to); // слово лишається в буфері; наступні клавіші друкуються вже в новій розкладці
@@ -621,6 +660,11 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
 
     // 2) щойно набране слово (після пробілу/Tab) — після автовиправлення це «скасувати»
     if let Some(last) = st.last.clone() {
+        let since = st.since_auto_fix();
+        if last.auto_fixed && since < RACE_MS {
+            st.log_noop(src, "just_fixed"); // те саме, що й вище, але виправив пробіл
+            return None;
+        }
         let job = st.manual_token(src, "last", &last.keys, last.shown, Some(last.boundary), hkl_now);
         if let Some(l) = st.last.as_mut() {
             l.shown = job.to; // повторне натискання перемкне назад
@@ -629,6 +673,8 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
         // Повторне натискання на тому самому слові повертає як було: користувач передумав — нічого не вчимо.
         st.pending_learn = match st.pending_learn.take() {
             Some(_) => None,
+            // Швидке «скасування» не вчимо: це могла бути та сама гонка з автоматом.
+            None if last.auto_fixed && since.min(last.at.elapsed().as_millis()) < RACE_MS => None,
             None => Some(PendingLearn { keys: last.keys.clone(), lang: job.to, revert: last.auto_fixed }),
         };
         st.prev1 = None;
@@ -786,6 +832,7 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             let prev = st.prev1.take();
             let carried = st.carry.take();
             let early = std::mem::take(&mut st.early_word);
+            let quick_revert = std::mem::take(&mut st.quick_revert);
             if keys.is_empty() {
                 return None;
             }
@@ -826,11 +873,12 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                     shown: to.unwrap_or(cur),
                     boundary: vk,
                     auto_fixed: to.is_some() || (early && mid.is_none()),
+                    at: Instant::now(),
                 })
             };
             // Слово, яке переносили вручну посеред набору, дописано: запам'ятаємо, коли користувач піде далі.
             // Якщо до того його переносив автомат — це скасування: вчимо «не чіпати».
-            if mid == Some(cur) && to.is_none() {
+            if mid == Some(cur) && to.is_none() && !(early && quick_revert) {
                 st.pending_learn = Some(PendingLearn { keys: keys.clone(), lang: cur, revert: early });
             }
             // Одна літера й пробіл: може знадобитись, якщо наступне слово виправлятимемо («d базу» -> «в базу»).
@@ -841,6 +889,7 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             match out.verdict {
                 Verdict::Fix(fix) if to.is_some() => {
                     st.last_fix_at = Some(Instant::now());
+                    st.auto_fix_at = Some(Instant::now());
                     let hkl = out.switch_to.map(|l| st.hkl(l));
                     let (mut back, mut text) = (keys.len(), fix.text);
                     if let Some(letter) = prev.filter(|p| p.lang == cur).and_then(|p| single_letter_fix(p.key, cur)) {
@@ -861,6 +910,7 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                 st.shown = win::layout_now().0; // у якій розкладці воно набирається
                 st.carry = None;
                 st.early_word = false;
+                st.pw_logged = false;
                 password::ask(t.fg, false); // поки набирається слово, дізнаємось, чи це не поле пароля
             }
             let key = Key { vk: v, shift: down(VK_SHIFT), caps: st.caps_now() };

@@ -157,6 +157,17 @@ impl Session {
                 self.streak = None;
                 self.expected = Some(cur);
             }
+            // Вкраплене слово з двох літер (`ру` -> `he` посеред українського тексту) — майже завжди одрук, а не
+            // англійське слово: не чіпаємо (на логах користувача таке виправлення було одне, і його скасували).
+            Verdict::Fix(fix)
+                if keys.len() < 3
+                    && self.mode.allows(fix.to)
+                    && self.dominant(2) == Some(cur)
+                    && self.streak != Some(fix.to) =>
+            {
+                self.expected = Some(cur);
+                return Outcome { verdict: Verdict::Short, switch_to, embedded, ctx, switched_by_user };
+            }
             Verdict::Fix(fix) => {
                 let to = fix.to;
                 // Людина пише мовою поточної розкладки, і це перше «чуже» слово поспіль — вкраплення.
@@ -178,6 +189,11 @@ impl Session {
             _ => self.expected = Some(cur),
         }
         Outcome { verdict, switch_to, embedded, ctx, switched_by_user }
+    }
+
+    /// Розкладку перемкнули ми (виправлення посеред слова): наступне слово в ній — не «користувач перемкнув сам».
+    pub fn expect(&mut self, lang: Lang) {
+        self.expected = Some(lang);
     }
 
     /// Користувач сам переніс слово в розкладку `to` (подвійний Shift): це найпевніший сигнал про мову.
@@ -232,6 +248,24 @@ mod tests {
         let (out, layout) = run(&["папки", "через", "sftp", "для", "потрібно"], Lang::Uk);
         assert_eq!(out, ["папки", "через", "sftp*", "для", "потрібно"]);
         assert_eq!(layout, Lang::Uk);
+    }
+
+    #[test]
+    fn two_letter_embedded_word_is_left_alone() {
+        // «ру» посеред українського тексту — одрук, а не `he` (на логах це виправлення скасували)
+        let mut d = dicts();
+        d.add_word(Lang::En, "he");
+        let mut s = Session::new();
+        let k = |w: &str, l| keys_for(w, l).unwrap();
+        // без контексту «ру» стало б `he` — перевіряємо, що правило саме про вкраплення
+        assert!(d.judge(&k("he", Lang::En), Lang::Uk).is_some());
+        s.on_word(&d, &k("папки", Lang::Uk), Lang::Uk, 0);
+        s.on_word(&d, &k("через", Lang::Uk), Lang::Uk, 1000);
+        let o = s.on_word(&d, &k("he", Lang::En), Lang::Uk, 2000);
+        assert_eq!(o.verdict.tag(), "short");
+        // а три літери — як і раніше, вкраплення
+        let o = s.on_word(&d, &k("sftp", Lang::En), Lang::Uk, 3000);
+        assert!(matches!(o.verdict, Verdict::Fix(_)) && o.embedded);
     }
 
     #[test]
