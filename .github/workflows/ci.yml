@@ -11,9 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Інструменти
+        timeout-minutes: 40
         run: |
+          # Лише варіант win32 (без posix: удвічі менше завантажувати — дзеркало Ubuntu на раннерах буває
+          # повільним, 115 МБ ішли 29 хв).
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64-win32 binutils-mingw-w64-x86-64
           rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
           rustup default stable
       - name: Тести бібліотеки
