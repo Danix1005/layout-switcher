@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use fst::{IntoStreamer, Set, Streamer};
 
-use crate::keymap::{char_for, convert, is_tracked_key, render, Key, Lang};
+use crate::keymap::{char_for, convert, is_key_run, is_tracked_key, render, Key, Lang};
 use crate::privacy::looks_secret;
 
 /// Звичайні слова (з основних словників) — від цієї довжини. Двобуквені — окремий режим нижче.
@@ -358,6 +358,12 @@ impl Dicts {
         if keys.iter().any(|k| !is_tracked_key(k.vk) || matches!(k.vk, 0xBB | 0xDC)) {
             return Verdict::NonWord;
         }
+        // Ряд клавіш підряд (`йцукен`, `фіва`, `тьбю.`): перевірка клавіатури, а не слово. Не виправляємо й
+        // розкладку не перемикаємо, хіба що одне з прочитань — справжнє слово («мить» = `vbnm`).
+        let whole = |l: Lang| render(keys, l).to_lowercase(); // цілком, без обрізання розділових знаків: `nm,./` — не `nm`
+        if is_key_run(keys, 4) && !self.solid(cur, &whole(cur)) && !self.solid(cur.other(), &whole(cur.other())) {
+            return Verdict::NonWord;
+        }
         // Адреса сайту чи пошти, набрана в українській розкладці: `аучютуе` -> `fex.net`.
         if let Some(fix) = self.web_fix(keys, cur) {
             return Verdict::Fix(fix);
@@ -503,6 +509,11 @@ impl Dicts {
     /// іншу мову — це «вкраплене» слово (англійський термін в українському тексті), його виправить пробіл.
     pub fn early_fix(&self, keys: &[Key], cur: Lang, ctx: Option<Lang>) -> Option<Fix> {
         if keys.len() < EARLY_MIN || keys.len() > EARLY_MAX || ctx == Some(cur) {
+            return None;
+        }
+        // Початок — ряд клавіш підряд (`ghj`, `vbn`): так починається й «про…», але й перевірка клавіатури
+        // `йцукен`. Почекаємо ще літеру: «прос…» уже не ряд.
+        if is_key_run(keys, 3) {
             return None;
         }
         if keys.iter().any(|k| !is_tracked_key(k.vk) || is_separator(k) || matches!(k.vk, 0xBB | 0xDC)) {
@@ -1441,5 +1452,30 @@ mod tests {
         assert!(d.has_prefix(Lang::Uk, "прик"));
         assert!(!d.has_prefix(Lang::Uk, "прж"));
         assert!(d.has_prefix(Lang::En, "th"));
+    }
+
+    // ── 0.9.4: ряди клавіш ──
+
+    #[test]
+    fn keyboard_runs_are_not_words() {
+        let d = Dicts::from_words(["nm", "iop", "as"], ["мить", "привіт"]);
+        for (t, l) in [("тьбю.", Lang::Uk), ("шщзх", Lang::Uk), ("йцукен", Lang::Uk), ("asdfgh", Lang::En), ("4321", Lang::En)] {
+            assert!(matches!(d.verdict(&typed(t, l), l, None), Verdict::NonWord), "{t}");
+        }
+        // справжнє слово, що лежить рядом клавіш, — виправляється як і раніше
+        assert_eq!(d.judge(&typed("vbnm", Lang::En), Lang::En).unwrap().text, "мить");
+        // не ряд: пропущена клавіша, зміна напрямку, інший ряд
+        assert!(!is_key_run(&typed("qwrt", Lang::En), 4));
+        assert!(!is_key_run(&typed("qwew", Lang::En), 4));
+        assert!(!is_key_run(&typed("qwea", Lang::En), 4));
+        assert!(is_key_run(&typed("poiu", Lang::En), 4));
+    }
+
+    #[test]
+    fn early_fix_waits_one_more_letter_after_a_run() {
+        let d = Dicts::from_words(["the"], ["про", "просто", "мити"]);
+        assert!(d.early_fix(&typed("ghj", Lang::En), Lang::En, None).is_none()); // ряд g h j
+        assert_eq!(d.early_fix(&typed("ghjc", Lang::En), Lang::En, None).unwrap().text, "прос");
+        assert!(d.early_fix(&typed("vbn", Lang::En), Lang::En, None).is_none());
     }
 }

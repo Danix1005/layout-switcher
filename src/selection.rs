@@ -103,54 +103,62 @@ unsafe fn run(req: &SelReq) {
         return;
     };
 
-    // 2) копіюємо виділене
-    let seq0 = GetClipboardSequenceNumber();
-    send_chord(VK_CONTROL, VK_INSERT);
-    let mut changed = false;
-    for _ in 0..40 {
-        sleep(Duration::from_millis(10));
-        if GetClipboardSequenceNumber() != seq0 {
-            changed = true;
-            break;
+    // 2) копіюємо виділене. Нічого не виділено — беремо слово перед курсором (Ctrl+Shift+←): так подвійний
+    //    Shift працює й тоді, коли програма вже «загубила» слово (клік мишкою, стрілки, Enter).
+    let mut word_before = false;
+    if !copy_selection() {
+        if !word_fallback_ok(&req.exe) {
+            noop(req, "no_selection");
+            return;
         }
-    }
-    if !changed {
-        noop(req, "no_selection"); // буфер не змінився: нічого не виділено (або застосунок ігнорує Ctrl+Insert)
-        return;
+        select_word_left();
+        if !copy_selection() {
+            collapse_right();
+            noop(req, "no_selection"); // і слова перед курсором нема (або застосунок ігнорує Ctrl+Insert)
+            return;
+        }
+        word_before = true;
     }
     sleep(Duration::from_millis(20)); // даємо застосунку дописати всі формати
+    // Відмовляємось: повертаємо буфер обміну, а якщо слово виділяли ми — й курсор на місце.
+    let bail = |reason: &'static str| {
+        restore(&backup);
+        if word_before {
+            collapse_right();
+        }
+        noop(req, reason);
+    };
 
     let Some(text) = get_text() else {
-        restore(&backup);
-        noop(req, "no_text");
+        bail("no_text");
         return;
     };
     if text.is_empty() {
-        restore(&backup);
-        noop(req, "empty");
+        bail("empty");
         return;
     }
     // Редактори на кшталт VS Code при Ctrl+Insert без виділення копіюють поточний рядок (з переносом у кінці):
     // це не виділення — вставка дублювала б рядок.
     if text.ends_with('\n') || text.ends_with('\r') {
-        restore(&backup);
-        noop(req, "ambiguous_line");
+        bail("ambiguous_line");
+        return;
+    }
+    // Слово перед курсором: Ctrl+Shift+← на початку рядка захоплює перенос рядка, а не слово.
+    if word_before && (text.trim_end().is_empty() || text.trim_end().chars().any(char::is_whitespace)) {
+        bail("no_word");
         return;
     }
     let n_chars = text.chars().count();
     if n_chars > MAX_CHARS {
-        restore(&backup);
-        noop(req, "too_long");
+        bail("too_long");
         return;
     }
     let Some(conv) = convert_text(&text, req.hint) else {
-        restore(&backup);
-        noop(req, "no_letters");
+        bail("no_letters");
         return;
     };
     if conv.text == text {
-        restore(&backup);
-        noop(req, "unchanged");
+        bail("unchanged");
         return;
     }
 
@@ -163,8 +171,7 @@ unsafe fn run(req: &SelReq) {
         type_text(&conv.text);
         true
     } else {
-        restore(&backup);
-        noop(req, "set_failed");
+        bail("set_failed");
         return;
     };
 
@@ -190,6 +197,9 @@ unsafe fn run(req: &SelReq) {
         ];
         if typed {
             f.push(("via", "typed".into())); // буфер обміну був зайнятий — результат набрано клавішами
+        }
+        if word_before {
+            f.push(("what", "word_before".into())); // нічого не було виділено — взяли слово перед курсором
         }
         if lg.words && masked {
             f.push(("masked", "1".into()));
@@ -231,6 +241,50 @@ unsafe fn scan(vk: u16) -> u16 {
 }
 
 /// Modifier+Insert (Insert — розширена клавіша).
+/// Де Ctrl+Shift+← виділяє не текст: таблиці (діапазон клітинок), файлові менеджери (файли).
+fn word_fallback_ok(exe: &str) -> bool {
+    let e = exe.to_lowercase();
+    !matches!(e.as_str(), "excel.exe" | "explorer.exe" | "totalcmd.exe" | "totalcmd64.exe" | "far.exe" | "doublecmd.exe")
+}
+
+/// Ctrl+Insert і чекаємо, чи змінився буфер обміну (до 400 мс). `false` — нічого не скопіювалось.
+unsafe fn copy_selection() -> bool {
+    let seq0 = GetClipboardSequenceNumber();
+    send_chord(VK_CONTROL, VK_INSERT);
+    for _ in 0..40 {
+        sleep(Duration::from_millis(10));
+        if GetClipboardSequenceNumber() != seq0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ctrl+Shift+← — виділити слово перед курсором.
+unsafe fn select_word_left() {
+    let left = 0x25u16; // VK_LEFT
+    let v: Vec<INPUT> = vec![
+        key_input(VK_CONTROL, scan(VK_CONTROL), 0),
+        key_input(VK_SHIFT, scan(VK_SHIFT), 0),
+        key_input(left, scan(left), KEYEVENTF_EXTENDEDKEY),
+        key_input(left, scan(left), KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+        key_input(VK_SHIFT, scan(VK_SHIFT), KEYEVENTF_KEYUP),
+        key_input(VK_CONTROL, scan(VK_CONTROL), KEYEVENTF_KEYUP),
+    ];
+    SendInput(v.len() as u32, v.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    sleep(Duration::from_millis(30));
+}
+
+/// → — зняти виділення, лишивши курсор там, де він був до Ctrl+Shift+←.
+unsafe fn collapse_right() {
+    let right = 0x27u16; // VK_RIGHT
+    let v: Vec<INPUT> = vec![
+        key_input(right, scan(right), KEYEVENTF_EXTENDEDKEY),
+        key_input(right, scan(right), KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+    ];
+    SendInput(v.len() as u32, v.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+}
+
 unsafe fn send_chord(modifier: u16, key: u16) {
     let v: Vec<INPUT> = vec![
         key_input(modifier, scan(modifier), 0),

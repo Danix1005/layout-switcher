@@ -118,6 +118,42 @@ pub fn char_for(k: Key, lang: Lang) -> char {
 }
 
 /// Як виглядає послідовність клавіш у заданій розкладці.
+/// Місце клавіші на клавіатурі: (ряд, позиція в ряду). Ряди — цифровий, верхній, середній, нижній.
+fn key_pos(vk: u32) -> Option<(u8, u8)> {
+    Some(match vk {
+        0xC0 => (0, 0),
+        0x31..=0x39 => (0, (vk - 0x30) as u8),
+        0x30 => (0, 10),
+        0xBD => (0, 11),
+        0xBB => (0, 12),
+        _ => {
+            const ROWS: [&[u32]; 3] = [
+                &[0x51, 0x57, 0x45, 0x52, 0x54, 0x59, 0x55, 0x49, 0x4F, 0x50, 0xDB, 0xDD, 0xDC], // q … ] \
+                &[0x41, 0x53, 0x44, 0x46, 0x47, 0x48, 0x4A, 0x4B, 0x4C, 0xBA, 0xDE],             // a … ; '
+                &[0x5A, 0x58, 0x43, 0x56, 0x42, 0x4E, 0x4D, 0xBC, 0xBE, 0xBF],                   // z … /
+            ];
+            let (r, c) = ROWS.iter().enumerate().find_map(|(r, row)| row.iter().position(|&k| k == vk).map(|c| (r, c)))?;
+            ((r + 1) as u8, c as u8)
+        }
+    })
+}
+
+/// Клавіші натиснуто підряд уздовж одного ряду (`qwer`, `фіва`, `vbnm`, `4321`): так перевіряють клавіатуру
+/// або «пробують» програму — це не слово, хоч його шматок і може збігтися зі словником (`iop`, `nm`, «мит»).
+pub fn is_key_run(keys: &[Key], min: usize) -> bool {
+    if keys.len() < min.max(2) {
+        return false;
+    }
+    let pos: Option<Vec<(u8, u8)>> = keys.iter().map(|k| key_pos(k.vk)).collect();
+    let Some(pos) = pos else { return false };
+    let row = pos[0].0;
+    if pos.iter().any(|p| p.0 != row) {
+        return false;
+    }
+    let step = pos[1].1 as i16 - pos[0].1 as i16;
+    (step == 1 || step == -1) && pos.windows(2).all(|w| w[1].1 as i16 - w[0].1 as i16 == step)
+}
+
 pub fn render(keys: &[Key], lang: Lang) -> String {
     keys.iter().map(|&k| char_for(k, lang)).collect()
 }
