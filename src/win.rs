@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD,
+    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, MapVirtualKeyExW, MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD,
     KEYBDINPUT, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -50,11 +50,39 @@ pub(crate) unsafe fn target() -> Target {
     Target { fg, focus }
 }
 
-fn lang_of(hkl: isize) -> Option<Lang> {
-    match (hkl as usize) & 0x3FF {
-        0x22 => Some(Lang::Uk),
-        0x09 => Some(Lang::En),
-        _ => None,
+/// Якою мовою друкує розкладка: дивимось не на мову з HKL, а на те, яку літеру дає клавіша F.
+/// Бо буває «мова українська, клавіатура США» (HKL 04090422): індикатор показує «УКР», а друкується
+/// англійською. Програма вважала її українською — і не виправляла `nht,f` («треба»), а «перемикаючись на
+/// українську», вмикала саме її.
+pub(crate) fn lang_of(hkl: isize) -> Option<Lang> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(isize, Option<Lang>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(l) = CACHE.with(|c| c.borrow().iter().find(|e| e.0 == hkl).map(|e| e.1)) {
+        return l;
+    }
+    let l = classify(hkl);
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 16 {
+            c.clear();
+        }
+        c.push((hkl, l));
+    });
+    l
+}
+
+fn classify(hkl: isize) -> Option<Lang> {
+    let lid = (hkl as usize) & 0x3FF;
+    let c = unsafe { MapVirtualKeyExW(0x46, 2 /* MAPVK_VK_TO_CHAR */, hkl as _) } & 0xFFFF;
+    let cyrillic = (0x400..0x500).contains(&c);
+    let latin = (b'A' as u32..=b'Z' as u32).contains(&c) || (b'a' as u32..=b'z' as u32).contains(&c);
+    match (cyrillic, latin, lid) {
+        (true, _, 0x22) => Some(Lang::Uk),
+        (_, true, 0x09 | 0x22) => Some(Lang::En),
+        (false, false, 0x22) => Some(Lang::Uk), // не вдалося спитати розкладку — як раніше, за мовою
+        (false, false, 0x09) => Some(Lang::En),
+        _ => None, // російська, німецька тощо — не наші
     }
 }
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use layout_switcher::apps::{is_sensitive, AppMode, AppRules, OffReason};
 use layout_switcher::detect::{single_letter_fix, Dicts, Verdict};
-use layout_switcher::keymap::is_key_run;
+use layout_switcher::keymap::{counter_index, counter_next, is_key_run};
 use layout_switcher::hotkey::DoubleShift;
 use layout_switcher::inject::InjectedPolicy;
 use layout_switcher::keymap::{convert, is_tracked_key, render, Key, Lang};
@@ -118,16 +118,24 @@ pub(crate) struct State {
     quick_revert: bool,
     /// У цьому слові вже записали `password_skip` (щоб не писати на кожну літеру).
     pw_logged: bool,
-    /// Скан-код попередньої натиснутої клавіші і скільки разів поспіль він зростав рівно на 1.
-    sc_prev: u32,
-    sc_run: u32,
-    /// Скільки натискань поспіль скан-коди йшли «звичайно» (не лічильником).
-    sc_normal: u32,
+    /// Попередня символьна клавіша і скільки разів поспіль наступна йшла за нею в «лічильнику» (`watch_keys`).
+    ctr_prev: u32,
+    ctr_run: u32,
+    /// Серед цих кроків лічильника була не символьна клавіша (пробіл, Enter…).
+    ctr_gap: bool,
+    /// Скільки символьних клавіш поспіль ішли «звичайно» (не лічильником).
+    ctr_normal: u32,
     /// У цьому вікні натискання приховано: хук бачить не справжні клавіші, а лічильник (`йцукен…`, `фіва…`) —
     /// так антивіруси «захищають» браузер від кейлогерів (ESET «Захист банківських операцій і платежів»).
     hidden: bool,
     /// Чи вже казали про це користувачеві (раз за запуск).
     hidden_told: bool,
+    /// Слово, що набирається, — продовження тексту, якого ми не бачили (стерли Backspace'ом далі, ніж знаємо:
+    /// «напишу,» → стерли «ишу,» і ще раз → набирають «ишу»). Його початку ми не знаємо — не виправляємо.
+    blind: bool,
+    /// Слово повернули Backspace'ом (стерли пробіл після нього): його вже раз перевірили, і що лишилося на
+    /// екрані — те користувач і хотів (міг уже скасувати виправлення). Автоматично його вдруге не чіпаємо.
+    restored: bool,
 }
 
 /// Стільки зростань скан-коду рівно на 1 поспіль (тобто 7 клавіш підряд по порядку на клавіатурі) —
@@ -168,6 +176,8 @@ struct LastToken {
     auto_fixed: bool,
     /// Коли слово закінчилось (пробіл).
     at: Instant,
+    /// Ми знаємо лише кінець цього слова (див. `State::blind`).
+    partial: bool,
 }
 
 /// Перевірка після виправлення: чи вікно з фокусом справді перейшло на потрібну розкладку.
@@ -240,11 +250,14 @@ impl State {
             auto_fix_at: None,
             quick_revert: false,
             pw_logged: false,
-            sc_prev: 0,
-            sc_run: 0,
-            sc_normal: 0,
+            ctr_prev: 0,
+            ctr_run: 0,
+            ctr_gap: false,
+            ctr_normal: 0,
             hidden: false,
             hidden_told: false,
+            blind: false,
+            restored: false,
         }
     }
 
@@ -280,20 +293,34 @@ impl State {
         self.early_word = false;
         self.quick_revert = false;
         self.pw_logged = false;
+        self.blind = false;
+        self.restored = false;
     }
 
-    /// Стежимо, чи не підмінено натискання: справжні клавіші хук бачить як лічильник скан-кодів
-    /// (0x15, 0x16, 0x17… — `yuiop[]` замість набраного `welcome`), а застосунок отримує правильні літери.
-    fn watch_scancodes(&mut self, sc: u32) {
-        if sc == self.sc_prev + 1 {
-            self.sc_run += 1;
-            self.sc_normal = 0;
-        } else {
-            self.sc_run = 0;
-            self.sc_normal += 1;
+    /// Стежимо, чи не підмінено натискання. Антивірус (ESET, «Захист клавіатури» в браузері) показує хуку
+    /// замість справжніх клавіш лічильник по клавіатурі (`counter_next`: `7890-=`, `qwerty`, `uiop[]\` замість
+    /// набраного), а застосунок отримує правильні літери. Пробіли при цьому справжні, і лічильник іде крізь них
+    /// далі: `7890-=` пробіл `qwerty`. Шість кроків лічильника підряд, і серед них був пробіл чи інша не символьна
+    /// клавіша, — ввід підмінено. (Без пробілу так буває й насправді: `1234567`, `qwertyu`.)
+    fn watch_keys(&mut self, vk: u32) {
+        if counter_index(vk).is_none() {
+            if self.ctr_prev != 0 {
+                self.ctr_gap = true;
+            }
+            return;
         }
-        self.sc_prev = sc;
-        if !self.hidden && self.sc_run >= HIDDEN_RUN {
+        if counter_next(self.ctr_prev, vk) {
+            self.ctr_run += 1;
+            if self.ctr_run >= 3 {
+                self.ctr_normal = 0; // окремі пари (`er`, `as`, `gh`) бувають і в справжньому наборі
+            }
+        } else {
+            self.ctr_run = 0;
+            self.ctr_gap = false;
+            self.ctr_normal += 1;
+        }
+        self.ctr_prev = vk;
+        if !self.hidden && self.ctr_run >= HIDDEN_RUN && self.ctr_gap {
             self.hidden = true;
             self.keys.clear();
             self.last = None;
@@ -309,7 +336,7 @@ impl State {
                     )
                 });
             }
-        } else if self.hidden && self.sc_normal >= VISIBLE_AGAIN {
+        } else if self.hidden && self.ctr_normal >= VISIBLE_AGAIN {
             self.hidden = false;
             log_event("input_hidden", vec![("exe", self.fg_exe.clone()), ("state", "off".into())]);
         }
@@ -322,7 +349,7 @@ impl State {
 
     /// Виправлення посеред слова (`Dicts::early_fix`): викликається після кожної літери, з третьої.
     unsafe fn try_early(&mut self) -> Option<Job> {
-        if self.keys.len() < 3 || self.manual_mid.is_some() || is_sensitive(&self.fg_exe) {
+        if self.keys.len() < 3 || self.manual_mid.is_some() || self.blind || self.restored || is_sensitive(&self.fg_exe) {
             return None;
         }
         let (lang, _) = win::layout_now();
@@ -543,11 +570,11 @@ fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10 | 0x11 | 0x12 | 0xA0..=0xA5 | 0x5B | 0x5C | 0x14)
 }
 
-pub(crate) fn on_key(vk: u32, sc: u32, is_down: bool, is_up: bool, injected: bool) -> bool {
+pub(crate) fn on_key(vk: u32, _sc: u32, is_down: bool, is_up: bool, injected: bool) -> bool {
     let job = with_state(|st| {
         st.last_key_at = Instant::now();
         if is_down && !injected && !is_modifier(vk) {
-            st.watch_scancodes(sc);
+            st.watch_keys(vk);
         }
 
         // Чужий програмний ввід: обробляти чи ні — вирішує політика (див. inject.rs).
@@ -694,7 +721,12 @@ unsafe fn manual(st: &mut State, src: &'static str) -> Option<Job> {
 
     // Натискання підмінено або буфер схожий на лічильник (`yuiop[]` замість `welcome`): перетворювати те, що ми
     // «бачили», не можна — це дало б нісенітницю. Беремо справжній текст з екрана: слово перед курсором.
-    if st.hidden || is_key_run(&st.keys, 4) || st.last.as_ref().is_some_and(|l| is_key_run(&l.keys, 4)) {
+    // Так само, коли ми знаємо лише кінець слова (`blind` / `partial`).
+    if st.hidden
+        || st.blind
+        || is_key_run(&st.keys, 4)
+        || st.last.as_ref().is_some_and(|l| l.partial || is_key_run(&l.keys, 4))
+    {
         st.keys.clear();
         st.last = None;
     }
@@ -772,7 +804,8 @@ unsafe fn enter_window(st: &mut State, t: win::Target) {
     st.fg = t.fg as usize;
     st.reset_word();
     st.hidden = false; // у новому вікні перевіряємо заново
-    st.sc_run = 0;
+    st.ctr_run = 0;
+    st.ctr_gap = false;
     st.session.reset();
     st.fg_exe = win::exe_of(t.fg);
     appsoff::set_current(&st.fg_exe);
@@ -897,9 +930,21 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
         BACK => {
             st.pending_learn = None; // стирає щойно перенесене — значить, не те
             if st.keys.is_empty() {
-                st.last = None; // стерли щось перед курсором — «останнє слово» більше не під курсором
                 st.prev1 = None;
                 st.log_undo("backspace");
+                let (lang, _) = win::layout_now();
+                match st.last.take() {
+                    // Перший Backspace після слова стирає пробіл: курсор знову в кінці того слова — продовжуємо
+                    // його (стерли «ишу,» з «напишу,» і дописують — це все ще «нап…», а не нове слово «ишу»).
+                    Some(l) if !l.partial && Some(l.shown) == lang => {
+                        st.keys = l.keys;
+                        st.shown = Some(l.shown);
+                        st.blind = false;
+                        st.restored = true;
+                    }
+                    // Стерли далі, ніж знаємо: наступні літери — продовження невідомого нам слова.
+                    _ => st.blind = true,
+                }
             } else {
                 st.keys.pop();
             }
@@ -913,6 +958,8 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
             let carried = st.carry.take();
             let early = std::mem::take(&mut st.early_word);
             let quick_revert = std::mem::take(&mut st.quick_revert);
+            let blind = std::mem::take(&mut st.blind);
+            let restored = std::mem::take(&mut st.restored);
             if keys.is_empty() {
                 return None;
             }
@@ -939,6 +986,13 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                 to = None;
                 log_event("kept_manual", vec![("exe", st.fg_exe.clone())]);
             }
+            // Знаємо лише кінець слова (стерли далі, ніж бачили): виправляти шматок не можна.
+            // Слово повернули Backspace'ом — його вже перевіряли.
+            if to.is_some() && (blind || restored) {
+                to = None;
+                let what = if blind { "tail" } else { "restored" };
+                log_event("partial_skip", vec![("exe", st.fg_exe.clone()), ("what", what.into())]);
+            }
             // Поле пароля: нічого не виправляємо.
             if to.is_some() && !password::safe_to_fix(st.fg as HWND) {
                 to = None;
@@ -954,6 +1008,7 @@ unsafe fn step(st: &mut State, vk: u32) -> Option<Job> {
                     boundary: vk,
                     auto_fixed: to.is_some() || (early && mid.is_none()),
                     at: Instant::now(),
+                    partial: blind,
                 })
             };
             // Слово, яке переносили вручну посеред набору, дописано: запам'ятаємо, коли користувач піде далі.

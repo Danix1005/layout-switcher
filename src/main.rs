@@ -39,6 +39,7 @@ use layout_switcher::apps::AppRules;
 use layout_switcher::cli::{self, Command, Options};
 use layout_switcher::detect::Dicts;
 use layout_switcher::inject::InjectedPolicy;
+use layout_switcher::keymap::Lang;
 use layout_switcher::session::Embed;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -154,9 +155,17 @@ fn run(opts: Options) {
         // «Українська (розширена)» (KLID 00020422), а не звичайна (00000422).
         let list = win::installed_layouts();
         let installed = list.iter().map(|&h| hkl_hex(h)).collect::<Vec<_>>().join(", ");
-        let pick = |pred: &dyn Fn(usize) -> bool| list.iter().copied().find(|&h| pred(h as usize & 0xFFFF));
-        let hkl_uk = pick(&|l| l == 0x0422);
-        let hkl_en = pick(&|l| l == 0x0409).or_else(|| pick(&|l| l & 0x3FF == 0x09));
+        // Мову розкладки визначаємо за тим, що вона друкує (win::lang_of): «українська мова з клавіатурою США»
+        // (04090422) — англійська. Для англійської спершу справжня англійська (мова 0x09).
+        let of = |lang: Lang| list.iter().copied().filter(move |&h| win::lang_of(h) == Some(lang));
+        let hkl_uk = of(Lang::Uk).next();
+        let hkl_en = of(Lang::En).find(|&h| h as usize & 0x3FF == 0x09).or_else(|| of(Lang::En).next());
+        // Розкладки, де мова й клавіатура не збігаються, — у лог: їх зазвичай додає сама Windows, і вони плутають.
+        let odd: Vec<String> = list
+            .iter()
+            .filter(|&&h| matches!((h as usize & 0x3FF, win::lang_of(h)), (0x22, Some(Lang::En)) | (0x09, Some(Lang::Uk))))
+            .map(|&h| hkl_hex(h))
+            .collect();
         let (Some(hkl_en), Some(hkl_uk)) = (hkl_en, hkl_uk) else {
             fail(&format!(
                 "У Windows має бути встановлена і англійська, і українська розкладка. Знайдено: [{installed}]"
@@ -175,6 +184,7 @@ fn run(opts: Options) {
             ("installed", installed.replace(", ", ",")),
             ("hkl_en", hkl_hex(hkl_en)),
             ("hkl_uk", hkl_hex(hkl_uk)),
+            ("odd_layouts", if odd.is_empty() { "-".into() } else { odd.join(",") }),
             ("hotkey", "double-lshift".to_string()),
             ("remote_session", (remote as u8).to_string()),
             ("injected", opts.injected.tag().to_string()),

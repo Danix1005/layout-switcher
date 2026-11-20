@@ -138,6 +138,29 @@ fn key_pos(vk: u32) -> Option<(u8, u8)> {
     })
 }
 
+/// Порядок, у якому антивірус (ESET, «Захист клавіатури» в браузері) підставляє хуку вигадані клавіші замість
+/// справжніх: лічильник іде по клавіатурі рядами — цифри з `-=`, потім `q`…`]` і зворотна коса, `a`…`'` і
+/// гравіс, `z`…`/` — і знову з початку. Пробіл, Enter, Backspace він не підмінює — їх хук бачить справжніми.
+const COUNTER_ORDER: [u32; 47] = [
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0xBD, 0xBB, // 1 … =
+    0x51, 0x57, 0x45, 0x52, 0x54, 0x59, 0x55, 0x49, 0x4F, 0x50, 0xDB, 0xDD, 0xDC, // q … \
+    0x41, 0x53, 0x44, 0x46, 0x47, 0x48, 0x4A, 0x4B, 0x4C, 0xBA, 0xDE, 0xC0, // a … `
+    0x5A, 0x58, 0x43, 0x56, 0x42, 0x4E, 0x4D, 0xBC, 0xBE, 0xBF, // z … /
+];
+
+/// Місце клавіші в «лічильнику» антивіруса (`None` — клавіша не символьна: пробіл, стрілки, Enter…).
+pub fn counter_index(vk: u32) -> Option<usize> {
+    COUNTER_ORDER.iter().position(|&k| k == vk)
+}
+
+/// Чи йде клавіша `vk` у «лічильнику» одразу після `prev`.
+pub fn counter_next(prev: u32, vk: u32) -> bool {
+    match (counter_index(prev), counter_index(vk)) {
+        (Some(a), Some(b)) => b == (a + 1) % COUNTER_ORDER.len(),
+        _ => false,
+    }
+}
+
 /// Клавіші натиснуто підряд уздовж одного ряду (`qwer`, `фіва`, `vbnm`, `4321`): так перевіряють клавіатуру
 /// або «пробують» програму — це не слово, хоч його шматок і може збігтися зі словником (`iop`, `nm`, «мит»).
 pub fn is_key_run(keys: &[Key], min: usize) -> bool {
@@ -424,5 +447,16 @@ mod tests {
         assert_eq!(char_for(k(0x35, true), Lang::Uk), '%');
         assert_eq!(char_for(k(0xBF, false), Lang::Uk), '.'); // `/` — не літера в жодній розкладці
         assert_eq!(char_for(k(0xC0, false), Lang::Uk), '\''); // апостроф від CapsLock не залежить
+    }
+
+    #[test]
+    fn counter_order_wraps_rows() {
+        assert!(counter_next(0xBB, 0x51)); // = → q
+        assert!(counter_next(0xDC, 0x41)); // \ → a
+        assert!(counter_next(0xC0, 0x5A)); // ` → z
+        assert!(counter_next(0xBF, 0x31)); // / → 1
+        assert!(counter_next(0x45, 0x52)); // e → r
+        assert!(!counter_next(0x45, 0x45));
+        assert!(!counter_next(0x20, 0x41)); // пробіл не в лічильнику
     }
 }
