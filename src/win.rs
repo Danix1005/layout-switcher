@@ -1,6 +1,8 @@
 //! Тонкі обгортки над Win32: куди насправді йде ввід, яка там розкладка, як її перемкнути, як «натиснути» клавіші.
 
+use std::cell::RefCell;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use layout_switcher::keymap::Lang;
 
@@ -16,8 +18,8 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, MapVirtualKeyExW, MapVirtualKeyW, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYEVENTF_KEYUP,
+    GetAsyncKeyState, GetKeyboardLayout, GetKeyboardLayoutList, MapVirtualKeyExW, MapVirtualKeyW, ToUnicodeEx, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, MessageBoxW, PostMessageW,
@@ -50,19 +52,24 @@ pub(crate) unsafe fn target() -> Target {
     Target { fg, focus }
 }
 
-/// Якою мовою друкує розкладка: дивимось не на мову з HKL, а на те, яку літеру дає клавіша F.
-/// Бо буває «мова українська, клавіатура США» (HKL 04090422): індикатор показує «УКР», а друкується
-/// англійською. Програма вважала її українською — і не виправляла `nht,f` («треба»), а «перемикаючись на
+/// Як визначати мову розкладки: за літерами (`true`) чи, як до 0.9.6, за мовою з HKL. Вибирає `choose_lang_method`
+/// на старті.
+static BY_CHARS: AtomicBool = AtomicBool::new(true);
+
+thread_local! {
+    static LANG_CACHE: RefCell<Vec<(isize, Option<Lang>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Якою мовою друкує розкладка. Дивимось не лише на мову з HKL, а на те, яку літеру дає клавіша F, бо буває «мова
+/// українська, клавіатура США» (HKL 04090422, її додає віддалений робочий стіл): індикатор показує «УКР», а
+/// друкується англійською. Програма вважала її українською — і не виправляла `nht,f` («треба»), а «перемикаючись на
 /// українську», вмикала саме її.
 pub(crate) fn lang_of(hkl: isize) -> Option<Lang> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<Vec<(isize, Option<Lang>)>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    if let Some(l) = CACHE.with(|c| c.borrow().iter().find(|e| e.0 == hkl).map(|e| e.1)) {
+    if let Some(l) = LANG_CACHE.with(|c| c.borrow().iter().find(|e| e.0 == hkl).map(|e| e.1)) {
         return l;
     }
-    let l = classify(hkl);
-    CACHE.with(|c| {
+    let l = if BY_CHARS.load(Ordering::Relaxed) { lang_by_chars(hkl) } else { lang_by_id(hkl) };
+    LANG_CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() > 16 {
             c.clear();
@@ -72,17 +79,53 @@ pub(crate) fn lang_of(hkl: isize) -> Option<Lang> {
     l
 }
 
-fn classify(hkl: isize) -> Option<Lang> {
-    let lid = (hkl as usize) & 0x3FF;
-    let c = unsafe { MapVirtualKeyExW(0x46, 2 /* MAPVK_VK_TO_CHAR */, hkl as _) } & 0xFFFF;
-    let cyrillic = (0x400..0x500).contains(&c);
-    let latin = (b'A' as u32..=b'Z' as u32).contains(&c) || (b'a' as u32..=b'z' as u32).contains(&c);
-    match (cyrillic, latin, lid) {
-        (true, _, 0x22) => Some(Lang::Uk),
-        (_, true, 0x09 | 0x22) => Some(Lang::En),
-        (false, false, 0x22) => Some(Lang::Uk), // не вдалося спитати розкладку — як раніше, за мовою
-        (false, false, 0x09) => Some(Lang::En),
-        _ => None, // російська, німецька тощо — не наші
+/// Мова за HKL: англійська чи українська (інші — не наші).
+fn lang_by_id(hkl: isize) -> Option<Lang> {
+    match (hkl as usize) & 0x3FF {
+        0x09 => Some(Lang::En),
+        0x22 => Some(Lang::Uk),
+        _ => None,
+    }
+}
+
+/// Мова за літерою, яку друкує клавіша F (без Shift): кирилиця — українська, латиниця — англійська.
+/// Лише для розкладок англійської й української мов; якщо спитати не вдалося — за мовою.
+fn lang_by_chars(hkl: isize) -> Option<Lang> {
+    let by_id = lang_by_id(hkl)?;
+    match key_char(hkl, 0x46) {
+        Some(c) if ('\u{400}'..'\u{500}').contains(&c) => Some(Lang::Uk),
+        Some(c) if c.is_ascii_alphabetic() => Some(Lang::En),
+        _ => Some(by_id),
+    }
+}
+
+/// Символ клавіші `vk` у розкладці `hkl` без модифікаторів. `MapVirtualKeyEx(MAPVK_VK_TO_CHAR)` тут не годиться:
+/// для літер A–Z Windows повертає латинську літеру в будь-якій розкладці (так було в 0.9.6, і програма не знайшла
+/// українську). `ToUnicodeEx` з прапорцем 4 не чіпає стан клавіатури (мертві клавіші тощо).
+fn key_char(hkl: isize, vk: u32) -> Option<char> {
+    let state = [0u8; 256];
+    let mut buf = [0u16; 8];
+    let n = unsafe {
+        let sc = MapVirtualKeyExW(vk, 0 /* MAPVK_VK_TO_VSC */, hkl as _);
+        ToUnicodeEx(vk, sc, state.as_ptr(), buf.as_mut_ptr(), buf.len() as i32, 4, hkl as _)
+    };
+    if n < 1 {
+        return None;
+    }
+    char::from_u32(buf[0] as u32)
+}
+
+/// Чи можна визначати мову за літерами: так — якщо так серед встановлених розкладок знайшлися і англійська, і
+/// українська. Інакше (щось пішло не так зі `ToUnicodeEx`) — як раніше, за мовою з HKL. Повертає назву способу для логу.
+pub(crate) fn choose_lang_method(list: &[isize]) -> &'static str {
+    let found = |l: Lang| list.iter().any(|&h| lang_by_chars(h) == Some(l));
+    let by_chars = found(Lang::En) && found(Lang::Uk);
+    BY_CHARS.store(by_chars, Ordering::Relaxed);
+    LANG_CACHE.with(|c| c.borrow_mut().clear());
+    if by_chars {
+        "chars"
+    } else {
+        "id"
     }
 }
 

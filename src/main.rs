@@ -32,7 +32,7 @@ mod win;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Duration;
 
 use layout_switcher::apps::AppRules;
@@ -65,6 +65,8 @@ static KB_HOOK: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static MOUSE_HOOK: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static REHOOKS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Нас щойно поставило оновлення: якщо запуститися не вдасться — повертаємо попередню версію.
+static AFTER_UPDATE: AtomicBool = AtomicBool::new(false);
 
 /// Файл поруч з exe, а якщо там нема — у поточній теці.
 fn beside_exe(name: &str) -> Option<PathBuf> {
@@ -81,6 +83,9 @@ fn beside_exe(name: &str) -> Option<PathBuf> {
 /// Помилка запуску: вікно повідомлення (консолі нема) і вихід.
 fn fail(msg: &str) -> ! {
     eprintln!("{msg}");
+    if AFTER_UPDATE.load(Ordering::Relaxed) && updater::roll_back(msg) {
+        std::process::exit(1);
+    }
     win::message_box(msg, MB_ICONERROR);
     std::process::exit(1);
 }
@@ -121,6 +126,7 @@ fn run(opts: Options) {
     // Нас запустила попередня версія після оновлення: чекаємо, поки вона завершиться (вона ще тримає значок).
     if let Some(pid) = opts.after_update {
         win::wait_for_process(pid, 20_000);
+        AFTER_UPDATE.store(true, Ordering::Relaxed);
     }
 
     if !unsafe { win::single_instance() } {
@@ -157,8 +163,10 @@ fn run(opts: Options) {
         let installed = list.iter().map(|&h| hkl_hex(h)).collect::<Vec<_>>().join(", ");
         // Мову розкладки визначаємо за тим, що вона друкує (win::lang_of): «українська мова з клавіатурою США»
         // (04090422) — англійська. Для англійської спершу справжня англійська (мова 0x09).
+        let lang_method = win::choose_lang_method(&list);
         let of = |lang: Lang| list.iter().copied().filter(move |&h| win::lang_of(h) == Some(lang));
-        let hkl_uk = of(Lang::Uk).next();
+        // Для української — не «українська мова з клавіатурою США» (старший код 0409), якщо є інша.
+        let hkl_uk = of(Lang::Uk).find(|&h| (h as usize >> 16) & 0xFFFF != 0x0409).or_else(|| of(Lang::Uk).next());
         let hkl_en = of(Lang::En).find(|&h| h as usize & 0x3FF == 0x09).or_else(|| of(Lang::En).next());
         // Розкладки, де мова й клавіатура не збігаються, — у лог: їх зазвичай додає сама Windows, і вони плутають.
         let odd: Vec<String> = list
@@ -185,6 +193,7 @@ fn run(opts: Options) {
             ("hkl_en", hkl_hex(hkl_en)),
             ("hkl_uk", hkl_hex(hkl_uk)),
             ("odd_layouts", if odd.is_empty() { "-".into() } else { odd.join(",") }),
+            ("lang_by", lang_method.to_string()),
             ("hotkey", "double-lshift".to_string()),
             ("remote_session", (remote as u8).to_string()),
             ("injected", opts.injected.tag().to_string()),

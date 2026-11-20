@@ -316,10 +316,42 @@ fn download_and_swap(u: &Update) -> Result<(), Fail> {
     }
 }
 
-/// Прибрати залишки попереднього оновлення (`.old`, `.new`). Стара копія може ще кілька секунд не відпускати файл.
+/// Нова версія не змогла запуститися одразу після оновлення (`fail` у `main.rs`): ставимо назад попередню
+/// (`.old`), кажемо чому й запускаємо її. Так зламаний випуск не лишає людину без програми (0.9.6 на деяких
+/// комп'ютерах не знаходила українську розкладку й одразу закривалась). `false` — повертати нічого.
+pub(crate) fn roll_back(reason: &str) -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let (old, failed) = (with_suffix(&exe, ".old"), with_suffix(&exe, ".failed"));
+    if !old.exists() {
+        return false;
+    }
+    let _ = fs::remove_file(&failed);
+    if fs::rename(&exe, &failed).is_err() {
+        return false;
+    }
+    if fs::rename(&old, &exe).is_err() {
+        let _ = fs::rename(&failed, &exe);
+        return false;
+    }
+    log("rollback", "ok", VERSION);
+    win::message_box(
+        &format!(
+            "Нова версія {VERSION} не змогла запуститися:\n\n{reason}\n\nПовернуто попередню версію — вона зараз \
+             запуститься. Виправлену версію програма запропонує, щойно вона вийде."
+        ),
+        MB_ICONERROR,
+    );
+    // Попередня копія дочекається, поки ми завершимось (значок і «один екземпляр» поки наші).
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--after-update=")).collect();
+    args.push(format!("--after-update={}", std::process::id()));
+    let _ = std::process::Command::new(&exe).args(&args).spawn();
+    true
+}
+
+/// Прибрати залишки попереднього оновлення (`.old`, `.new`, `.failed`). Стара копія може ще кілька секунд не відпускати файл.
 pub(crate) fn cleanup_leftovers() {
     let Ok(exe) = std::env::current_exe() else { return };
-    let paths = [with_suffix(&exe, ".old"), with_suffix(&exe, ".new")];
+    let paths = [with_suffix(&exe, ".old"), with_suffix(&exe, ".new"), with_suffix(&exe, ".failed")];
     if !paths.iter().any(|p| p.exists()) {
         return;
     }
